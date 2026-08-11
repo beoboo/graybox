@@ -1,0 +1,8 @@
+[package]
+name = "graybox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# minifb ("mini frame buffer") opens a window and shows our pixels in it.
+minifb = "0.27"
