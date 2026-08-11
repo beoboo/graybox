@@ -24,6 +24,146 @@ pub fn decode_tile(chr: &[u8], tile: usize) -> [[u8; 8]; 8] {
     pixels
 }
 
+use std::cell::Cell;
+
+/// The picture chip's own state: its private memory and the handful of
+/// registers the CPU can reach through the bus.
+///
+/// Two fields wear a `Cell` — a box Rust lets us change even through a
+/// shared reference. It exists for exactly our situation: hardware that
+/// changes state when it is merely LOOKED AT.
+pub struct Ppu {
+    /// The nametables' RAM: 2 KiB on the console's board.
+    pub vram: [u8; 2048],
+
+    /// The eight palettes — 32 bytes the games fill at boot.
+    pub palette_ram: [u8; 32],
+
+    /// PPUCTRL, as last written: a byte of settings.
+    pub ctrl: u8,
+
+    /// Whether the PPU is in its vertical-blank rest period.
+    pub vblank: Cell<bool>,
+
+    /// Where in PPU memory the next data access will land. A `Cell`,
+    /// because READS move it too.
+    address: Cell<u16>,
+
+    /// The one-byte waiting room for PPUDATA reads: what a read hands
+    /// back is the byte fetched by the PREVIOUS read.
+    read_buffer: Cell<u8>,
+
+    /// The address arrives through an 8-bit register in two knocks;
+    /// this remembers whether the SECOND knock is next.
+    expecting_low: Cell<bool>,
+
+    /// How this cartridge's board arranges the four nametable names
+    /// over the two real rooms of VRAM.
+    vertical_mirroring: bool,
+}
+
+impl Ppu {
+    /// A powered-on PPU: memory blank, registers zero, wired the way
+    /// the cartridge's board dictates.
+    pub fn new(vertical_mirroring: bool) -> Ppu {
+        Ppu {
+            vram: [0; 2048],
+            palette_ram: [0; 32],
+            ctrl: 0,
+            vblank: Cell::new(false),
+            address: Cell::new(0),
+            read_buffer: Cell::new(0),
+            expecting_low: Cell::new(false),
+            vertical_mirroring,
+        }
+    }
+
+    /// Fold a nametable address ($2000-$2FFF and its echo) onto the two
+    /// real 1 KiB rooms. Four names, two rooms: VERTICAL mirroring puts
+    /// the rooms side by side ($2000/$2800 share, $2400/$2C00 share);
+    /// HORIZONTAL stacks them ($2000/$2400 share, $2800/$2C00 share).
+    fn mirror(&self, address: u16) -> usize {
+        let index = address as usize & 0x0FFF; // within the 4 KiB window
+        let name = index / 0x400; // which of the four names, 0..=3
+        let room = if self.vertical_mirroring {
+            name & 1
+        } else {
+            name / 2
+        };
+        room * 0x400 + (index & 0x3FF)
+    }
+
+    /// A write to PPUADDR ($2006): half of an address — big half on the
+    /// first knock, little half on the second.
+    pub fn write_address(&mut self, value: u8) {
+        let address = self.address.get();
+        if self.expecting_low.get() {
+            self.address.set((address & 0xFF00) | value as u16);
+        } else {
+            self.address.set((address & 0x00FF) | ((value as u16) << 8));
+        }
+        self.expecting_low.set(!self.expecting_low.get());
+    }
+
+    /// A write to PPUDATA ($2007): one byte into PPU memory, wherever
+    /// the address points — which then walks forward on its own.
+    pub fn write_data(&mut self, value: u8) {
+        let address = self.address.get() & 0x3FFF;
+        match address {
+            // Pattern tables are the cartridge's ROM: writes bounce off.
+            0x0000..=0x1FFF => {}
+
+            // The nametables' two rooms, found through the board's
+            // mirroring arrangement.
+            0x2000..=0x3EFF => self.vram[self.mirror(address)] = value,
+
+            // The palettes' 32 bytes.
+            _ => self.palette_ram[address as usize & 0x001F] = value,
+        }
+
+        self.step_address();
+    }
+
+    /// The auto-step every PPUDATA access ends with: +1 normally, +32 —
+    /// one screen-row down — when PPUCTRL asks for column order.
+    fn step_address(&self) {
+        let step = if self.ctrl & 0b0000_0100 != 0 { 32 } else { 1 };
+        self.address.set(self.address.get().wrapping_add(step));
+    }
+
+    /// A read of PPUSTATUS ($2002): reports vblank in the top bit — and
+    /// the act of looking clears the flag AND resets the address
+    /// register to expect a first knock. Reading, here, is touching —
+    /// which is why those two fields live in `Cell`s.
+    pub fn read_status(&self) -> u8 {
+        let status = (self.vblank.get() as u8) << 7;
+        self.vblank.set(false);
+        self.expecting_low.set(false);
+        status
+    }
+
+    /// A read of PPUDATA ($2007). The byte is the small part — it
+    /// arrives one read LATE, through the waiting room. The important
+    /// part is that reading walks the address forward exactly like
+    /// writing, and games lean on that to step past addresses without
+    /// disturbing them.
+    pub fn read_data(&self) -> u8 {
+        let address = self.address.get() & 0x3FFF;
+        let value = self.read_buffer.get();
+
+        self.read_buffer.set(match address {
+            // Pattern tables live on the cartridge — not wired from
+            // this side of the chip yet.
+            0x0000..=0x1FFF => 0,
+            0x2000..=0x3EFF => self.vram[self.mirror(address)],
+            _ => self.palette_ram[address as usize & 0x001F],
+        });
+
+        self.step_address();
+        value
+    }
+}
+
 /// The NES's whole crayon box: the 64 colors it can ever show, as RGB.
 ///
 /// The real chip stores no RGB anywhere — it emits an analog TV signal,
@@ -88,5 +228,123 @@ mod tests {
         for color in SYSTEM_PALETTE {
             assert_eq!(color >> 24, 0);
         }
+    }
+
+    #[test]
+    fn the_address_arrives_big_half_first() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x23);
+        ppu.write_address(0x45);
+        ppu.write_data(0x99);
+        assert_eq!(ppu.vram[0x0345], 0x99); // $2345 & $07FF
+    }
+
+    #[test]
+    fn data_writes_walk_forward_on_their_own() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x20);
+        ppu.write_address(0x00);
+        ppu.write_data(0x11);
+        ppu.write_data(0x22);
+        assert_eq!(ppu.vram[0], 0x11);
+        assert_eq!(ppu.vram[1], 0x22);
+    }
+
+    #[test]
+    fn ctrl_can_make_the_walk_go_by_rows() {
+        let mut ppu = Ppu::new(false);
+        ppu.ctrl = 0b0000_0100; // column order: step by 32
+        ppu.write_address(0x20);
+        ppu.write_address(0x00);
+        ppu.write_data(0x11);
+        ppu.write_data(0x22);
+        assert_eq!(ppu.vram[32], 0x22); // one screen-row down
+    }
+
+    #[test]
+    fn palette_writes_land_in_the_palette() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x3F);
+        ppu.write_address(0x01);
+        ppu.write_data(0x16);
+        assert_eq!(ppu.palette_ram[1], 0x16);
+    }
+
+    #[test]
+    fn looking_at_status_clears_the_flag() {
+        let ppu = Ppu::new(false);
+        ppu.vblank.set(true);
+        assert_eq!(ppu.read_status() & 0x80, 0x80);
+        assert_eq!(ppu.read_status() & 0x80, 0); // looking took it
+    }
+
+    #[test]
+    fn horizontal_mirroring_keeps_2800_out_of_2000() {
+        // Chase's exact accident: write a title byte at $2086, then
+        // clear $2886 (nametable C). On a horizontal board those are
+        // different rooms — the title must survive.
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x20);
+        ppu.write_address(0x86);
+        ppu.write_data(0x40);
+        ppu.write_address(0x28);
+        ppu.write_address(0x86);
+        ppu.write_data(0x00);
+        assert_eq!(ppu.vram[0x086], 0x40); // the title byte, alive
+        assert_eq!(ppu.vram[0x486], 0x00); // the other room, cleared
+    }
+
+    #[test]
+    fn vertical_mirroring_shares_the_other_way() {
+        // On a vertical board, $2000 and $2800 ARE the same room.
+        let mut ppu = Ppu::new(true);
+        ppu.write_address(0x20);
+        ppu.write_address(0x86);
+        ppu.write_data(0x40);
+        ppu.write_address(0x28);
+        ppu.write_address(0x86);
+        ppu.write_data(0x77);
+        assert_eq!(ppu.vram[0x086], 0x77); // same room: overwritten
+    }
+
+    #[test]
+    fn reading_data_walks_the_address_too() {
+        // The trick real palette loaders use: READ $2007 and discard
+        // the byte, just to step past an address without touching it.
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x3F);
+        ppu.write_address(0x00);
+        ppu.write_data(0x11); // lands at $3F00
+        ppu.read_data(); // a footstep past $3F01, touching nothing
+        ppu.write_data(0x33); // must land at $3F02
+        assert_eq!(ppu.palette_ram[0], 0x11);
+        assert_eq!(ppu.palette_ram[1], 0x00); // undisturbed
+        assert_eq!(ppu.palette_ram[2], 0x33);
+    }
+
+    #[test]
+    fn data_reads_arrive_one_read_late() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x20);
+        ppu.write_address(0x00);
+        ppu.write_data(0x55);
+
+        ppu.write_address(0x20);
+        ppu.write_address(0x00);
+        assert_eq!(ppu.read_data(), 0x00); // the stale waiting room
+        assert_eq!(ppu.read_data(), 0x55); // yesterday's byte, today
+    }
+
+    #[test]
+    fn looking_at_status_also_resets_the_two_knocks() {
+        // A game half-through an address read $2002: the next knock
+        // must count as a FIRST knock again.
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x3F); // first knock of an abandoned address
+        ppu.read_status();
+        ppu.write_address(0x20); // a fresh first knock: the big half
+        ppu.write_address(0x08);
+        ppu.write_data(0x77);
+        assert_eq!(ppu.vram[8], 0x77);
     }
 }

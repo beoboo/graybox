@@ -825,6 +825,17 @@ impl Cpu {
         }
     }
 
+    /// The Non-Maskable Interrupt — the tap on the CPU's shoulder that
+    /// no flag can refuse. Note where we were and the notes themselves
+    /// (ghost bit 4 stays CLEAR: hardware knocked, not BRK), hang the
+    /// do-not-disturb sign, and follow the NMI vector at $FFFA.
+    pub fn nmi(&mut self) {
+        self.push_word(self.pc);
+        self.push((self.status | 0b0010_0000) & !0b0001_0000);
+        self.status |= FLAG_INTERRUPT_DISABLE;
+        self.pc = self.read_word(0xFFFA);
+    }
+
     /// Every official opcode's name and total length in bytes — the
     /// decoder ring for the diary. `None` means unofficial.
     pub fn opcode_name_and_length(opcode: u8) -> Option<(&'static str, u16)> {
@@ -962,6 +973,7 @@ mod tests {
             prg_rom: prg,
             chr_rom: Vec::new(),
             mapper: 0,
+            vertical_mirroring: false,
         }
     }
 
@@ -1298,6 +1310,26 @@ mod tests {
         ]);
         assert_eq!(cpu.pc, 0x800B); // the BRK at $800A fetched, stopped
         assert!(cpu.status & FLAG_ZERO != 0); // the pulled Z came back
+    }
+
+    #[test]
+    fn nmi_taps_the_shoulder_and_rti_returns() {
+        // A handler at $8005 that just RTIs; the NMI vector points at
+        // it; main is an INX. Tap mid-program: the frame must survive.
+        let mut cartridge = test_cartridge(&[0xE8, 0xE8, 0xE8, 0xE8, 0x00, 0x40]);
+        cartridge.prg_rom[0x3FFA] = 0x05; // NMI vector: $8005...
+        cartridge.prg_rom[0x3FFB] = 0x80; // ...where the RTI waits
+        let mut cpu = Cpu::new(cartridge);
+        cpu.reset();
+
+        cpu.step(); // one INX
+        cpu.nmi();
+        assert_eq!(cpu.pc, 0x8005); // in the handler
+
+        cpu.step(); // the RTI
+        assert_eq!(cpu.pc, 0x8001); // back exactly where we were
+        while cpu.step() {}
+        assert_eq!(cpu.x, 4); // no INX lost along the way
     }
 
     #[test]

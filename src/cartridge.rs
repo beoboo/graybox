@@ -11,6 +11,11 @@ pub struct Cartridge {
     /// Which cartridge board ("mapper") the game expects. Number 0 is
     /// NROM, the simplest: two ROMs, no tricks.
     pub mapper: u8,
+
+    /// How the board wires the picture chip's two rooms of name RAM:
+    /// stacked side by side (vertical mirroring) or one above the
+    /// other (horizontal).
+    pub vertical_mirroring: bool,
 }
 
 impl Cartridge {
@@ -30,6 +35,9 @@ impl Cartridge {
         // ride in the top of byte 6, its high four bits in byte 7.
         let mapper = (bytes[7] & 0xF0) | (bytes[6] >> 4);
 
+        // Byte 6's lowest bit: how the board wires the name RAM.
+        let vertical_mirroring = bytes[6] & 0b0000_0001 != 0;
+
         // Some old files carry a 512-byte "trainer" before the ROMs —
         // a relic of 1990s copying hardware. Step politely over it.
         let mut start = 16;
@@ -45,6 +53,7 @@ impl Cartridge {
             prg_rom: bytes[start..start + prg_size].to_vec(),
             chr_rom: bytes[start + prg_size..start + prg_size + chr_size].to_vec(),
             mapper,
+            vertical_mirroring,
         })
     }
 
