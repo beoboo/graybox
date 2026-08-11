@@ -6,6 +6,8 @@ mod cpu;
 mod cartridge;
 // The wiring between the CPU and everything else.
 mod bus;
+// The picture chip.
+mod ppu;
 
 use minifb::{Key, Scale, Window, WindowOptions};
 use cpu::Cpu;
@@ -18,22 +20,31 @@ const WIDTH: usize = 256;
 const HEIGHT: usize = 240;
 
 fn main() {
-    // One path on the command line boots it. A second path is a golden
-    // log to grade ourselves against.
+    // One path on the command line boots a machine — and now we KEEP it.
+    // Two paths run the grader instead.
     let args: Vec<String> = std::env::args().collect();
-    match args.len() {
-        2 => boot_rom(&args[1]),
-        3 => nestest_diff(&args[1], &args[2]),
-        _ => {}
-    }
+    let machine = match args.len() {
+        2 => Some(boot_rom(&args[1])),
+        3 => {
+            nestest_diff(&args[1], &args[2]);
+            None
+        }
+        _ => None,
+    };
 
     // The frame buffer: one number for every pixel on our screen.
     // 0 means black, so right now this is a picture of nothing.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
 
-    draw_test_pattern(&mut buffer);
-
-    draw_tile_grid(&mut buffer);
+    // A machine in hand? Show its cartridge's art. Otherwise, the
+    // trusty test pattern.
+    match &machine {
+        Some(cpu) => draw_pattern_tables(&cpu.bus.cartridge.chr_rom, &mut buffer),
+        None => {
+            draw_test_pattern(&mut buffer);
+            draw_tile_grid(&mut buffer);
+        }
+    }
 
     // Ask the operating system for a window. `Scale::X2` doubles every pixel,
     // because 256x240 is tiny on a modern screen.
@@ -101,9 +112,9 @@ fn draw_tile_grid(buffer: &mut [u32]) {
     }
 }
 
-/// Load a .nes file, wire a whole machine around it, press reset, and
-/// watch the first dozen instructions run.
-fn boot_rom(path: &str) {
+/// Load a .nes file, wire a whole machine around it, press reset, watch
+/// the first dozen instructions run — and hand the machine back.
+fn boot_rom(path: &str) -> Cpu {
     let bytes = std::fs::read(path).expect("could not read the file");
     let cartridge = Cartridge::load(&bytes).expect("could not parse the file");
 
@@ -126,6 +137,33 @@ fn boot_rom(path: &str) {
         cpu.step();
     }
     println!("  ...and on it goes.");
+    // Hand the machine back to whoever booted it.
+    cpu
+}
+
+/// Draw every tile in CHR ROM, in four grays: pattern table 0 on the
+/// left, pattern table 1 on the right. The game's whole sticker album.
+fn draw_pattern_tables(chr: &[u8], buffer: &mut [u32]) {
+    // The four pixel values, darkest to lightest.
+    const GRAYS: [u32; 4] = [0x0000_0000, 0x0055_5555, 0x00AA_AAAA, 0x00FF_FFFF];
+
+    for table in 0..2 {
+        for tile in 0..256 {
+            let pixels = ppu::decode_tile(chr, table * 256 + tile);
+
+            // Sixteen tiles to a row; the second table starts 128
+            // pixels to the right; 56 centers it all vertically.
+            let corner_x = table * 128 + (tile % 16) * 8;
+            let corner_y = 56 + (tile / 16) * 8;
+
+            for row in 0..8 {
+                for col in 0..8 {
+                    let color = GRAYS[pixels[row][col] as usize];
+                    buffer[(corner_y + row) * WIDTH + corner_x + col] = color;
+                }
+            }
+        }
+    }
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden
