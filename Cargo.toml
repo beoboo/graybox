@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 # minifb ("mini frame buffer") opens a window and shows our pixels in it.
 minifb = "0.27"
+
+# cpal ("cross-platform audio library") opens the speaker the same way.
+cpal = "0.15"

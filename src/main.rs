@@ -10,8 +10,16 @@ mod bus;
 mod ppu;
 // The player's end of the machine.
 mod controller;
+// The sound chip.
+mod apu;
 
 use minifb::{Key, Scale, Window, WindowOptions};
+// The speaker's plumbing: a queue of samples, shared with the audio
+// thread behind a lock.
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
 use cartridge::Cartridge;
 
@@ -44,6 +52,10 @@ fn main() {
         draw_test_pattern(&mut buffer);
         draw_tile_grid(&mut buffer);
     }
+
+    // Open the speaker. `None` — no audio device, or a grumpy one —
+    // just means a silent movie; the game must still run.
+    let audio = start_audio();
 
     // Ask the operating system for a window. `Scale::X2` doubles every pixel,
     // because 256x240 is tiny on a modern screen.
@@ -118,6 +130,12 @@ fn main() {
 
             render_background(cpu, &mut buffer);
             render_sprites(cpu, &mut buffer);
+
+            // A frame of picture gets its sixtieth of a second
+            // of sound.
+            if let Some(speaker) = &audio {
+                speaker.sing_a_frame(&mut cpu.bus.apu);
+            }
         }
 
         window
@@ -301,6 +319,66 @@ fn sprite_palette(ppu: &ppu::Ppu, attributes: u8) -> [u8; 4] {
         ppu.palette_ram[base + 2],
         ppu.palette_ram[base + 3],
     ]
+}
+
+/// The speaker's end of the machine: the stream that plays (sound
+/// stops the moment it is dropped), the queue of samples on their
+/// way out, and the rate the device wants them at.
+struct Speaker {
+    _stream: cpal::Stream,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    sample_rate: f32,
+}
+
+impl Speaker {
+    /// One frame of sound to match a frame of picture: a sixtieth of
+    /// a second of samples, sung from wherever the channels stand.
+    /// The cap keeps a slow frame from letting the queue — and the
+    /// lag behind the picture — grow forever.
+    fn sing_a_frame(&self, apu: &mut apu::Apu) {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.len() < self.sample_rate as usize / 15 {
+            for _ in 0..self.sample_rate as usize / 60 {
+                queue.push_back(apu.sample(self.sample_rate));
+            }
+        }
+    }
+}
+
+/// Ask the operating system for the speaker, and start it playing
+/// from its queue.
+fn start_audio() -> Option<Speaker> {
+    let device = cpal::default_host().default_output_device()?;
+    let config = device.default_output_config().ok()?;
+    let sample_rate = config.sample_rate().0 as f32;
+    let channels = config.channels() as usize;
+
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let feed = Arc::clone(&queue);
+
+    // The sound card calls this little function whenever it wants
+    // more sound — from its own thread, on its own schedule. Whatever
+    // is queued gets played; an empty queue plays silence, because a
+    // speaker with nothing to say should say nothing.
+    let stream = device
+        .build_output_stream(
+            &config.into(),
+            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut queue = feed.lock().unwrap();
+                for frame in out.chunks_mut(channels) {
+                    let sample = queue.pop_front().unwrap_or(0.0);
+                    for speaker in frame {
+                        *speaker = sample;
+                    }
+                }
+            },
+            |error| eprintln!("the speaker complained: {error}"),
+            None,
+        )
+        .ok()?;
+
+    stream.play().ok()?;
+    Some(Speaker { _stream: stream, queue, sample_rate })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden

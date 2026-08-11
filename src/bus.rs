@@ -1,5 +1,6 @@
 //! The bus — the wiring that decides which chip answers each address.
 
+use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::controller::Controller;
 use crate::ppu::Ppu;
@@ -17,6 +18,9 @@ pub struct Bus {
 
     /// The first controller port.
     pub controller: Controller,
+
+    /// The sound chip.
+    pub apu: Apu,
 }
 
 impl Bus {
@@ -27,6 +31,7 @@ impl Bus {
             // Built before `cartridge` moves in, since it reads from it.
             ppu: Ppu::new(cartridge.vertical_mirroring),
             controller: Controller::new(),
+            apu: Apu::new(),
             cartridge,
         }
     }
@@ -93,6 +98,11 @@ impl Bus {
                     self.ppu.oam[offset as usize] = byte;
                 }
             }
+
+            // Everything else on the sound chip's page: the APU's
+            // registers. ($4014 and $4016 were claimed above; $4017,
+            // the frame counter, falls through inside — Part II.)
+            0x4000..=0x4017 => self.apu.write(address, value),
 
             // Writes to ROM change nothing. The clue is in the name.
             0x8000..=0xFFFF => {}
