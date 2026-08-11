@@ -1,5 +1,8 @@
 //! The 6502 CPU — the brain of the NES.
 
+use crate::bus::Bus;
+use crate::cartridge::Cartridge;
+
 /// The CPU: a handful of small "pockets" (registers) and the memory it
 /// reads and writes.
 pub struct Cpu {
@@ -22,8 +25,8 @@ pub struct Cpu {
     /// The status byte: eight tiny yes/no flags packed into one byte.
     pub status: u8,
 
-    /// 64 KiB of memory — every address from $0000 to $FFFF.
-    pub memory: [u8; 65536],
+    /// The bus: everything the CPU can reach lives on its far side.
+    pub bus: Bus,
 }
 
 /// The Carry flag: the ninth bit of the last addition — and, for
@@ -74,8 +77,9 @@ pub enum AddressingMode {
 }
 
 impl Cpu {
-    /// A brand-new CPU: every pocket empty, every byte of memory zero.
-    pub fn new() -> Cpu {
+    /// A CPU wired to a cartridge: pockets empty, RAM blank, the
+    /// program waiting at the far end of the bus.
+    pub fn new(cartridge: Cartridge) -> Cpu {
         Cpu {
             a: 0,
             x: 0,
@@ -83,18 +87,18 @@ impl Cpu {
             pc: 0,
             sp: 0,
             status: 0,
-            memory: [0; 65536],
+            bus: Bus::new(cartridge),
         }
     }
 
-    /// Read the byte stored at an address.
+    /// Read one byte — by asking the bus.
     pub fn read(&self, address: u16) -> u8 {
-        self.memory[address as usize]
+        self.bus.read(address)
     }
 
-    /// Store a byte at an address.
+    /// Store one byte — by telling the bus.
     pub fn write(&mut self, address: u16, value: u8) {
-        self.memory[address as usize] = value;
+        self.bus.write(address, value)
     }
 
     /// Read a two-byte number. The 6502 stores the LITTLE end first:
@@ -809,16 +813,30 @@ impl Cpu {
 mod tests {
     use super::*;
 
+    /// A throwaway cartridge for the robots: the program at $8000, the
+    /// reset vector pointing at it.
+    fn test_cartridge(program: &[u8]) -> Cartridge {
+        let mut prg = vec![0u8; 16 * 1024];
+        prg[..program.len()].copy_from_slice(program);
+        prg[0x3FFC] = 0x00; // the reset vector: $8000, little end first
+        prg[0x3FFD] = 0x80;
+        Cartridge {
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+            mapper: 0,
+        }
+    }
+
     #[test]
     fn what_you_write_is_what_you_read() {
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.write(0x0200, 42);
         assert_eq!(cpu.read(0x0200), 42);
     }
 
     #[test]
     fn words_are_stored_little_end_first() {
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.write(0x0200, 0x34); // the little end comes first...
         cpu.write(0x0201, 0x12); // ...the big end second.
         assert_eq!(cpu.read_word(0x0200), 0x1234);
@@ -826,10 +844,8 @@ mod tests {
 
     #[test]
     fn reset_starts_at_the_reset_vector() {
-        let mut cpu = Cpu::new();
-        cpu.write(0xFFFC, 0x00);
-        cpu.write(0xFFFD, 0x80);
-
+        // The vector is baked into the cartridge now — as in real life.
+        let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.reset();
 
         assert_eq!(cpu.pc, 0x8000);
@@ -840,15 +856,22 @@ mod tests {
         assert_eq!(cpu.status, 0b0010_0100);
     }
 
-    /// Put a little program at $8000, point the reset vector at it,
-    /// run it until BRK, and hand the CPU back for inspection.
+    #[test]
+    fn ram_echoes_every_two_kilobytes() {
+        // One write, four addresses: the 2 KiB of RAM answers again at
+        // $0800, $1000, and $1800.
+        let mut cpu = Cpu::new(test_cartridge(&[]));
+        cpu.write(0x0042, 0x99);
+        assert_eq!(cpu.read(0x0042), 0x99);
+        assert_eq!(cpu.read(0x0842), 0x99);
+        assert_eq!(cpu.read(0x1042), 0x99);
+        assert_eq!(cpu.read(0x1842), 0x99);
+    }
+
+    /// Run a program from a proper cartridge until BRK, and hand the
+    /// CPU back for inspection.
     fn run_program(program: &[u8]) -> Cpu {
-        let mut cpu = Cpu::new();
-        for (i, byte) in program.iter().enumerate() {
-            cpu.write(0x8000 + i as u16, *byte);
-        }
-        cpu.write(0xFFFC, 0x00);
-        cpu.write(0xFFFD, 0x80);
+        let mut cpu = Cpu::new(test_cartridge(program));
         cpu.reset();
 
         while cpu.step() {}
@@ -893,18 +916,13 @@ mod tests {
         assert!(cpu.status & FLAG_ZERO != 0);
     }
 
-    /// Like `run_program`, but first plant some values in memory —
-    /// the addressing modes need something to find.
+    /// Like `run_program`, but first plant some values in RAM — the
+    /// addressing modes need something to find.
     fn run_program_with(program: &[u8], plants: &[(u16, u8)]) -> Cpu {
-        let mut cpu = Cpu::new();
-        for (i, byte) in program.iter().enumerate() {
-            cpu.write(0x8000 + i as u16, *byte);
-        }
+        let mut cpu = Cpu::new(test_cartridge(program));
         for (address, value) in plants {
             cpu.write(*address, *value);
         }
-        cpu.write(0xFFFC, 0x00);
-        cpu.write(0xFFFD, 0x80);
         cpu.reset();
 
         while cpu.step() {}
@@ -945,13 +963,8 @@ mod tests {
     #[test]
     fn lda_absolute_y_adds_y() {
         // The test sets Y by hand — robots may reach anywhere.
-        let mut cpu = Cpu::new();
-        for (i, byte) in [0xB9, 0x00, 0x02, 0x00].iter().enumerate() {
-            cpu.write(0x8000 + i as u16, *byte);
-        }
+        let mut cpu = Cpu::new(test_cartridge(&[0xB9, 0x00, 0x02, 0x00]));
         cpu.write(0x0205, 0x66);
-        cpu.write(0xFFFC, 0x00);
-        cpu.write(0xFFFD, 0x80);
         cpu.reset();
         cpu.y = 5;
         while cpu.step() {}
@@ -972,15 +985,10 @@ mod tests {
     #[test]
     fn lda_indirect_y_follows_the_pointer_then_adds_y() {
         // The pointer at $20/$21 says $0300; Y adds 4; $0304 holds the prize.
-        let mut cpu = Cpu::new();
-        for (i, byte) in [0xB1, 0x20, 0x00].iter().enumerate() {
-            cpu.write(0x8000 + i as u16, *byte);
-        }
+        let mut cpu = Cpu::new(test_cartridge(&[0xB1, 0x20, 0x00]));
         cpu.write(0x0020, 0x00); // pointer, little end
         cpu.write(0x0021, 0x03); // pointer, big end
         cpu.write(0x0304, 0x99);
-        cpu.write(0xFFFC, 0x00);
-        cpu.write(0xFFFD, 0x80);
         cpu.reset();
         cpu.y = 4;
         while cpu.step() {}
@@ -1258,17 +1266,18 @@ mod tests {
     #[test]
     fn jmp_indirect_obeys_the_page_edge_law() {
         // Pointer at $02FF: low byte from $02FF, high byte from $0200 —
-        // NOT $0300. A decoy program waits where a wrong answer leads.
-        let cpu = run_program_with(
-            &[0x6C, 0xFF, 0x02, 0xA9, 0x63, 0x00],
-            &[
-                (0x02FF, 0x05),
-                (0x0200, 0x80),
-                (0x0300, 0x99),   // wrong high byte would send us to $9905...
-                (0x9905, 0xA9),   // ...where a decoy LDA #$42 tells on it.
-                (0x9906, 0x42),
-            ],
-        );
+        // NOT $0300. The decoy now lives where only ROM can put it:
+        // baked into the cartridge, at the address a wrong answer names.
+        let mut cartridge = test_cartridge(&[0x6C, 0xFF, 0x02, 0xA9, 0x63, 0x00]);
+        cartridge.prg_rom[0x1905] = 0xA9; // $9905: the decoy, LDA #$42...
+        cartridge.prg_rom[0x1906] = 0x42; // ...which tells on a wrong jump.
+
+        let mut cpu = Cpu::new(cartridge);
+        cpu.write(0x02FF, 0x05);
+        cpu.write(0x0200, 0x80);
+        cpu.write(0x0300, 0x99); // the wrong high byte, lying in wait
+        cpu.reset();
+        while cpu.step() {}
         assert_eq!(cpu.a, 0);
     }
 }

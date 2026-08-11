@@ -4,6 +4,8 @@
 mod cpu;
 // The drawer for everything that comes out of a .nes file.
 mod cartridge;
+// The wiring between the CPU and everything else.
+mod bus;
 
 use minifb::{Key, Scale, Window, WindowOptions};
 use cpu::Cpu;
@@ -16,14 +18,10 @@ const WIDTH: usize = 256;
 const HEIGHT: usize = 240;
 
 fn main() {
-    // Give the CPU a moment in the terminal before the window steals
-    // the show.
-    cpu_demo();
-
-    // Handed a .nes file on the command line? Report its vital signs.
+    // Handed a .nes file on the command line? Boot it.
     // (`if let` is a one-armed match: do this only if there IS a value.)
     if let Some(path) = std::env::args().nth(1) {
-        rom_info(&path);
+        boot_rom(&path);
     }
 
     // The frame buffer: one number for every pixel on our screen.
@@ -100,66 +98,29 @@ fn draw_tile_grid(buffer: &mut [u32]) {
     }
 }
 
-/// Load a little machine-code program, wake the CPU, run it to the end,
-/// and print every pocket after every instruction.
-fn cpu_demo() {
-    // One helper routine, called from TWO different places — and thanks
-    // to the stack, each call comes back to the right place.
-    //
-    // addr   bytes     meaning
-    // 8000   A9 05     LDA #5      start A at 5
-    // 8002   20 09 80  JSR $8009   call the helper...
-    // 8005   20 09 80  JSR $8009   ...call it AGAIN
-    // 8008   00        BRK         done
-    // 8009   18        CLC         the helper: add 10 to A...
-    // 800A   69 0A     ADC #10
-    // 800C   60        RTS         ...and go back to whoever called
-    let program = [
-        0xA9, 0x05, 0x20, 0x09, 0x80, 0x20, 0x09, 0x80, 0x00, 0x18, 0x69, 0x0A, 0x60,
-    ];
-
-    let mut cpu = Cpu::new();
-
-    // Copy the program into memory at $8000 — the neighborhood where
-    // cartridge programs traditionally live.
-    for (i, byte) in program.iter().enumerate() {
-        cpu.write(0x8000 + i as u16, *byte);
-    }
-
-    // Write $8000 into the reset vector, little end first,
-    // so the CPU wakes up inside our program.
-    cpu.write(0xFFFC, 0x00);
-    cpu.write(0xFFFD, 0x80);
-
-    cpu.reset();
-
-    // Run it, printing every pocket after every instruction.
-    println!("  pc     a  x  y");
-    println!("  ---------------");
-    loop {
-        let keep_going = cpu.step();
-        println!("  {:04X}   {:02X} {:02X} {:02X}", cpu.pc, cpu.a, cpu.x, cpu.y);
-        if !keep_going {
-            println!("  (BRK: the program is done)");
-            break;
-        }
-    }
-}
-
-/// Load a .nes file and report what's inside the plastic.
-fn rom_info(path: &str) {
+/// Load a .nes file, wire a whole machine around it, press reset, and
+/// watch the first dozen instructions run.
+fn boot_rom(path: &str) {
     let bytes = std::fs::read(path).expect("could not read the file");
     let cartridge = Cartridge::load(&bytes).expect("could not parse the file");
 
     println!();
     println!("  {path}");
-    println!("  PRG ROM: {} KiB (the program)", cartridge.prg_rom.len() / 1024);
-    println!("  CHR ROM: {} KiB (the graphics)", cartridge.chr_rom.len() / 1024);
-    println!("  mapper:  {}", cartridge.mapper);
+    println!(
+        "  PRG ROM: {} KiB, CHR ROM: {} KiB, mapper {}",
+        cartridge.prg_rom.len() / 1024,
+        cartridge.chr_rom.len() / 1024,
+        cartridge.mapper,
+    );
 
-    // The reset vector, straight off the cartridge: where this game's
-    // program begins.
-    let low = cartridge.read_prg(0xFFFC) as u16;
-    let high = cartridge.read_prg(0xFFFD) as u16;
-    println!("  starts at: ${:04X}", (high << 8) | low);
+    let mut cpu = Cpu::new(cartridge);
+    cpu.reset();
+
+    println!("  pc     a  x  y");
+    println!("  ---------------");
+    for _ in 0..12 {
+        cpu.step();
+        println!("  {:04X}   {:02X} {:02X} {:02X}", cpu.pc, cpu.a, cpu.x, cpu.y);
+    }
+    println!("  ...and on it goes.");
 }
