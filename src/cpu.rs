@@ -41,6 +41,14 @@ pub const FLAG_NEGATIVE: u8 = 0b1000_0000;
 /// zero — a signed-arithmetic accident the Carry can't see.
 pub const FLAG_OVERFLOW: u8 = 0b0100_0000;
 
+/// The Interrupt-disable flag: the CPU's "do not disturb" sign.
+pub const FLAG_INTERRUPT_DISABLE: u8 = 0b0000_0100;
+
+/// The Decimal flag. On most 6502s it switches ADC and SBC into
+/// base-ten mode. The NES's chip lets you set it — and ignores it.
+/// The flag flips; the math never changes. We are exactly that honest.
+pub const FLAG_DECIMAL: u8 = 0b0000_1000;
+
 /// The ways an instruction can say WHERE its value lives.
 /// (`Clone, Copy` lets us hand modes around as freely as numbers.)
 #[derive(Clone, Copy)]
@@ -51,6 +59,8 @@ pub enum AddressingMode {
     ZeroPage,
     /// Zero page, then add X.
     ZeroPageX,
+    /// Zero page, then add Y.
+    ZeroPageY,
     /// A full two-byte address. Anywhere in memory.
     Absolute,
     /// Absolute, then add X.
@@ -136,6 +146,12 @@ impl Cpu {
                 let base = self.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
                 base.wrapping_add(self.x) as u16
+            }
+            // The Y twin — wrapping inside the page, same as X.
+            AddressingMode::ZeroPageY => {
+                let base = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                base.wrapping_add(self.y) as u16
             }
             // Two bytes, little end first — a full address.
             AddressingMode::Absolute => {
@@ -297,6 +313,156 @@ impl Cpu {
                 self.pc = return_address.wrapping_add(1);
             }
 
+            // LDX and LDY — every flavor each of them is sold in.
+            0xA2 => self.ldx(AddressingMode::Immediate),
+            0xA6 => self.ldx(AddressingMode::ZeroPage),
+            0xB6 => self.ldx(AddressingMode::ZeroPageY),
+            0xAE => self.ldx(AddressingMode::Absolute),
+            0xBE => self.ldx(AddressingMode::AbsoluteY),
+
+            0xA0 => self.ldy(AddressingMode::Immediate),
+            0xA4 => self.ldy(AddressingMode::ZeroPage),
+            0xB4 => self.ldy(AddressingMode::ZeroPageX),
+            0xAC => self.ldy(AddressingMode::Absolute),
+            0xBC => self.ldy(AddressingMode::AbsoluteX),
+
+            // STX and STY.
+            0x86 => self.stx(AddressingMode::ZeroPage),
+            0x96 => self.stx(AddressingMode::ZeroPageY),
+            0x8E => self.stx(AddressingMode::Absolute),
+
+            0x84 => self.sty(AddressingMode::ZeroPage),
+            0x94 => self.sty(AddressingMode::ZeroPageX),
+            0x8C => self.sty(AddressingMode::Absolute),
+
+            // TAY / TYA / TXA — the name spells the route: Transfer A
+            // to Y, Transfer Y to A, Transfer X to A.
+            0xA8 => {
+                self.y = self.a;
+                self.update_zero_and_negative(self.y);
+            }
+            0x98 => {
+                self.a = self.y;
+                self.update_zero_and_negative(self.a);
+            }
+            0x8A => {
+                self.a = self.x;
+                self.update_zero_and_negative(self.a);
+            }
+
+            // INC / DEC — counting directly in memory.
+            0xE6 => self.modify(AddressingMode::ZeroPage, Cpu::inc_value),
+            0xF6 => self.modify(AddressingMode::ZeroPageX, Cpu::inc_value),
+            0xEE => self.modify(AddressingMode::Absolute, Cpu::inc_value),
+            0xFE => self.modify(AddressingMode::AbsoluteX, Cpu::inc_value),
+
+            0xC6 => self.modify(AddressingMode::ZeroPage, Cpu::dec_value),
+            0xD6 => self.modify(AddressingMode::ZeroPageX, Cpu::dec_value),
+            0xCE => self.modify(AddressingMode::Absolute, Cpu::dec_value),
+            0xDE => self.modify(AddressingMode::AbsoluteX, Cpu::dec_value),
+
+            // INY, DEY, DEX — INcrement and DEcrement: the index pockets
+            // count both ways.
+            0xC8 => {
+                self.y = self.y.wrapping_add(1);
+                self.update_zero_and_negative(self.y);
+            }
+            0x88 => {
+                self.y = self.y.wrapping_sub(1);
+                self.update_zero_and_negative(self.y);
+            }
+            0xCA => {
+                self.x = self.x.wrapping_sub(1);
+                self.update_zero_and_negative(self.x);
+            }
+
+            // AND / ORA / EOR — the bit tools, promoted to instructions.
+            0x29 => self.and(AddressingMode::Immediate),
+            0x25 => self.and(AddressingMode::ZeroPage),
+            0x35 => self.and(AddressingMode::ZeroPageX),
+            0x2D => self.and(AddressingMode::Absolute),
+            0x3D => self.and(AddressingMode::AbsoluteX),
+            0x39 => self.and(AddressingMode::AbsoluteY),
+            0x21 => self.and(AddressingMode::IndirectX),
+            0x31 => self.and(AddressingMode::IndirectY),
+
+            0x09 => self.ora(AddressingMode::Immediate),
+            0x05 => self.ora(AddressingMode::ZeroPage),
+            0x15 => self.ora(AddressingMode::ZeroPageX),
+            0x0D => self.ora(AddressingMode::Absolute),
+            0x1D => self.ora(AddressingMode::AbsoluteX),
+            0x19 => self.ora(AddressingMode::AbsoluteY),
+            0x01 => self.ora(AddressingMode::IndirectX),
+            0x11 => self.ora(AddressingMode::IndirectY),
+
+            0x49 => self.eor(AddressingMode::Immediate),
+            0x45 => self.eor(AddressingMode::ZeroPage),
+            0x55 => self.eor(AddressingMode::ZeroPageX),
+            0x4D => self.eor(AddressingMode::Absolute),
+            0x5D => self.eor(AddressingMode::AbsoluteX),
+            0x59 => self.eor(AddressingMode::AbsoluteY),
+            0x41 => self.eor(AddressingMode::IndirectX),
+            0x51 => self.eor(AddressingMode::IndirectY),
+
+            // BIT — the tester.
+            0x24 => self.bit(AddressingMode::ZeroPage),
+            0x2C => self.bit(AddressingMode::Absolute),
+
+            // The shifts, on A directly...
+            0x0A => self.a = self.asl_value(self.a),
+            0x4A => self.a = self.lsr_value(self.a),
+            0x2A => self.a = self.rol_value(self.a),
+            0x6A => self.a = self.ror_value(self.a),
+
+            // ...and on memory, through `modify`.
+            0x06 => self.modify(AddressingMode::ZeroPage, Cpu::asl_value),
+            0x16 => self.modify(AddressingMode::ZeroPageX, Cpu::asl_value),
+            0x0E => self.modify(AddressingMode::Absolute, Cpu::asl_value),
+            0x1E => self.modify(AddressingMode::AbsoluteX, Cpu::asl_value),
+
+            0x46 => self.modify(AddressingMode::ZeroPage, Cpu::lsr_value),
+            0x56 => self.modify(AddressingMode::ZeroPageX, Cpu::lsr_value),
+            0x4E => self.modify(AddressingMode::Absolute, Cpu::lsr_value),
+            0x5E => self.modify(AddressingMode::AbsoluteX, Cpu::lsr_value),
+
+            0x26 => self.modify(AddressingMode::ZeroPage, Cpu::rol_value),
+            0x36 => self.modify(AddressingMode::ZeroPageX, Cpu::rol_value),
+            0x2E => self.modify(AddressingMode::Absolute, Cpu::rol_value),
+            0x3E => self.modify(AddressingMode::AbsoluteX, Cpu::rol_value),
+
+            0x66 => self.modify(AddressingMode::ZeroPage, Cpu::ror_value),
+            0x76 => self.modify(AddressingMode::ZeroPageX, Cpu::ror_value),
+            0x6E => self.modify(AddressingMode::Absolute, Cpu::ror_value),
+            0x7E => self.modify(AddressingMode::AbsoluteX, Cpu::ror_value),
+
+            // The rest of the flag switches — SEt or CLear, plus a
+            // letter: SEI/CLI for Interrupt-disable, SED/CLD for
+            // Decimal (the flag the NES ignores), CLV for oVerflow —
+            // which nothing sets directly.
+            0x78 => self.status |= FLAG_INTERRUPT_DISABLE,
+            0x58 => self.status &= !FLAG_INTERRUPT_DISABLE,
+            0xF8 => self.status |= FLAG_DECIMAL,
+            0xD8 => self.status &= !FLAG_DECIMAL,
+            0xB8 => self.status &= !FLAG_OVERFLOW,
+
+            // TXS — Transfer X to the Stack pointer. The ONE transfer
+            // that takes no notes: SP is plumbing, not data. A classic
+            // trap.
+            0x9A => self.sp = self.x,
+
+            // TSX — Transfer the Stack pointer to X, notes and all.
+            0xBA => {
+                self.x = self.sp;
+                self.update_zero_and_negative(self.x);
+            }
+
+            // JMP (indirect) — jump to wherever the pointer points.
+            0x6C => self.jmp_indirect(),
+
+            // NOP — No OPeration: do nothing, beautifully. Real programs
+            // use it to fill space and to wait for exactly one moment.
+            0xEA => {}
+
             // TAX — Transfer A to X. A keeps its value; X gets a copy.
             0xAA => {
                 self.x = self.a;
@@ -441,6 +607,185 @@ impl Cpu {
         let low = self.pull() as u16;
         let high = self.pull() as u16;
         (high << 8) | low
+    }
+
+    /// LDX — LoaD X: LDA's twin for the X pocket.
+    fn ldx(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.x = self.read(address);
+        self.update_zero_and_negative(self.x);
+    }
+
+    /// LDY — LoaD Y: the same once more, for Y.
+    fn ldy(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.y = self.read(address);
+        self.update_zero_and_negative(self.y);
+    }
+
+    /// STX — STore X. Like STA, it takes no notes.
+    fn stx(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.write(address, self.x);
+    }
+
+    /// STY — STore Y.
+    fn sty(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.write(address, self.y);
+    }
+
+    /// Read-modify-write: fetch a value from memory, hand it to a worker
+    /// function, store the worker's answer back where the value came
+    /// from. The worker is a PARAMETER — in Rust, a plain function's
+    /// name is a value you can pass around, like any other.
+    fn modify(&mut self, mode: AddressingMode, worker: fn(&mut Cpu, u8) -> u8) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        let result = worker(self, value);
+        self.write(address, result);
+    }
+
+    /// INC's worker: one more, clock rules.
+    fn inc_value(&mut self, value: u8) -> u8 {
+        let result = value.wrapping_add(1);
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// DEC's worker: one less, clock rules — 0 rolls back to 255.
+    fn dec_value(&mut self, value: u8) -> u8 {
+        let result = value.wrapping_sub(1);
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// AND — keep only the bits A and the value share.
+    fn and(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.a &= value;
+        self.update_zero_and_negative(self.a);
+    }
+
+    /// ORA — switch on every bit the value has on.
+    fn ora(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.a |= value;
+        self.update_zero_and_negative(self.a);
+    }
+
+    /// EOR — exclusive or: flip every bit the value has on.
+    fn eor(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.a ^= value;
+        self.update_zero_and_negative(self.a);
+    }
+
+    /// BIT — test BITs without touching A. Zero reports whether A and
+    /// the value share any set bits; N and V become plain copies of the
+    /// value's top two bits — which is why the flag masks fit.
+    fn bit(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+
+        if self.a & value == 0 {
+            self.status |= FLAG_ZERO;
+        } else {
+            self.status &= !FLAG_ZERO;
+        }
+        if value & FLAG_NEGATIVE != 0 {
+            self.status |= FLAG_NEGATIVE;
+        } else {
+            self.status &= !FLAG_NEGATIVE;
+        }
+        if value & FLAG_OVERFLOW != 0 {
+            self.status |= FLAG_OVERFLOW;
+        } else {
+            self.status &= !FLAG_OVERFLOW;
+        }
+    }
+
+    /// ASL's worker — Arithmetic Shift Left: every bit one slot up,
+    /// a 0 in at the bottom, the old top bit out into Carry.
+    /// Numerically: times two, ninth bit caught.
+    fn asl_value(&mut self, value: u8) -> u8 {
+        if value & 0x80 != 0 {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        let result = value << 1;
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// LSR's worker — Logical Shift Right: divide by two, the old
+    /// bottom bit out into Carry.
+    fn lsr_value(&mut self, value: u8) -> u8 {
+        if value & 0x01 != 0 {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        let result = value >> 1;
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// ROL's worker — ROtate Left: like ASL, but the OLD Carry comes
+    /// in at the bottom. Nine bits going around in a circle.
+    fn rol_value(&mut self, value: u8) -> u8 {
+        let old_carry = self.status & FLAG_CARRY != 0;
+        if value & 0x80 != 0 {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        let mut result = value << 1;
+        if old_carry {
+            result |= 0x01;
+        }
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// ROR's worker — the same circle, turning the other way.
+    fn ror_value(&mut self, value: u8) -> u8 {
+        let old_carry = self.status & FLAG_CARRY != 0;
+        if value & 0x01 != 0 {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        let mut result = value >> 1;
+        if old_carry {
+            result |= 0x80;
+        }
+        self.update_zero_and_negative(result);
+        result
+    }
+
+    /// JMP's indirect flavor: follow a full 16-bit pointer — with the
+    /// 6502's famous flaw. If the pointer starts at the END of a page
+    /// ($xxFF), the chip fetches the second byte from the START of that
+    /// same page, not from the next one. A mistake printed into millions
+    /// of chips stops being a mistake: games rely on it, so it's the
+    /// law, and we obey the law.
+    fn jmp_indirect(&mut self) {
+        let pointer = self.operand_address(AddressingMode::Absolute);
+
+        let low = self.read(pointer) as u16;
+        let high_address = if pointer & 0x00FF == 0x00FF {
+            pointer & 0xFF00 // wrap to the page's own start
+        } else {
+            pointer + 1
+        };
+        let high = self.read(high_address) as u16;
+
+        self.pc = (high << 8) | low;
     }
 
     /// Almost every instruction ends the same way: the CPU looks at the
@@ -791,5 +1136,139 @@ mod tests {
         // The pushed copy of status always shows bits 4 and 5 set.
         let cpu = run_program(&[0x08, 0x00]);
         assert_eq!(cpu.read(0x01FD) & 0b0011_0000, 0b0011_0000);
+    }
+
+    #[test]
+    fn ldx_speaks_zero_page_y() {
+        // LDY #2, then LDX $0E,Y reads from $0010.
+        let cpu = run_program_with(&[0xA0, 0x02, 0xB6, 0x0E, 0x00], &[(0x0010, 0x33)]);
+        assert_eq!(cpu.x, 0x33);
+    }
+
+    #[test]
+    fn stx_and_sty_store_their_pockets() {
+        // LDX #7, STX $10; LDY #8, STY $11.
+        let cpu = run_program(&[0xA2, 0x07, 0x86, 0x10, 0xA0, 0x08, 0x84, 0x11, 0x00]);
+        assert_eq!(cpu.read(0x0010), 7);
+        assert_eq!(cpu.read(0x0011), 8);
+    }
+
+    #[test]
+    fn tay_and_tya_round_trip() {
+        // LDA #9, TAY, LDA #0, TYA — the 9 comes home through Y.
+        let cpu = run_program(&[0xA9, 0x09, 0xA8, 0xA9, 0x00, 0x98, 0x00]);
+        assert_eq!(cpu.a, 9);
+    }
+
+    #[test]
+    fn dex_wraps_zero_around_to_255() {
+        // LDX #0, DEX — clock rules, backwards.
+        let cpu = run_program(&[0xA2, 0x00, 0xCA, 0x00]);
+        assert_eq!(cpu.x, 0xFF);
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+    }
+
+    #[test]
+    fn inc_and_dec_count_in_memory() {
+        // $10 starts at 41: two INCs and a DEC leave the answer.
+        let cpu = run_program_with(&[0xE6, 0x10, 0xE6, 0x10, 0xC6, 0x10, 0x00], &[(0x0010, 41)]);
+        assert_eq!(cpu.read(0x0010), 42);
+    }
+
+    #[test]
+    fn and_ora_eor_do_bit_arithmetic() {
+        // ((0x0C AND 0x0A) OR 0x01) EOR 0xFF = 0xF6.
+        let cpu = run_program(&[0xA9, 0x0C, 0x29, 0x0A, 0x09, 0x01, 0x49, 0xFF, 0x00]);
+        assert_eq!(cpu.a, 0xF6);
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+    }
+
+    #[test]
+    fn bit_reports_without_touching_a() {
+        // A = 0 shares no bits with $C0; N and V copy the value's top bits.
+        let cpu = run_program_with(&[0xA9, 0x00, 0x24, 0x10, 0x00], &[(0x0010, 0xC0)]);
+        assert_eq!(cpu.a, 0); // untouched
+        assert!(cpu.status & FLAG_ZERO != 0);
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+        assert!(cpu.status & FLAG_OVERFLOW != 0);
+    }
+
+    #[test]
+    fn asl_doubles_and_catches_the_top_bit() {
+        // LDA #$81, ASL A: 0x81 doubled is 0x02 with the ninth bit in Carry.
+        let cpu = run_program(&[0xA9, 0x81, 0x0A, 0x00]);
+        assert_eq!(cpu.a, 0x02);
+        assert!(cpu.status & FLAG_CARRY != 0);
+    }
+
+    #[test]
+    fn lsr_halves_and_catches_the_bottom_bit() {
+        // LDA #5, LSR A: 2, and the odd bit lands in Carry.
+        let cpu = run_program(&[0xA9, 0x05, 0x4A, 0x00]);
+        assert_eq!(cpu.a, 0x02);
+        assert!(cpu.status & FLAG_CARRY != 0);
+    }
+
+    #[test]
+    fn rol_and_ror_turn_the_nine_bit_circle() {
+        // SEC, LDA #0, ROL: the old Carry rolls in at the bottom.
+        let cpu = run_program(&[0x38, 0xA9, 0x00, 0x2A, 0x00]);
+        assert_eq!(cpu.a, 0x01);
+
+        // SEC, LDA #0, ROR: same circle, other direction.
+        let cpu = run_program(&[0x38, 0xA9, 0x00, 0x6A, 0x00]);
+        assert_eq!(cpu.a, 0x80);
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+    }
+
+    #[test]
+    fn shifts_work_on_memory_too() {
+        // ASL $10 twice: 1 becomes 4, in place.
+        let cpu = run_program_with(&[0x06, 0x10, 0x06, 0x10, 0x00], &[(0x0010, 0x01)]);
+        assert_eq!(cpu.read(0x0010), 0x04);
+    }
+
+    #[test]
+    fn txs_moves_x_to_sp_and_tsx_back() {
+        // LDX #5, TXS, LDX #0, TSX — SP remembers, X gets it back.
+        let cpu = run_program(&[0xA2, 0x05, 0x9A, 0xA2, 0x00, 0xBA, 0x00]);
+        assert_eq!(cpu.x, 5);
+    }
+
+    #[test]
+    fn sei_sed_set_their_flags_and_clv_clears_overflow() {
+        // SEI, SED — then stage an overflow and CLV it away.
+        let cpu = run_program(&[0x78, 0xF8, 0xA9, 0x50, 0x69, 0x50, 0xB8, 0x00]);
+        assert!(cpu.status & FLAG_INTERRUPT_DISABLE != 0);
+        assert!(cpu.status & FLAG_DECIMAL != 0);
+        assert!(cpu.status & FLAG_OVERFLOW == 0);
+    }
+
+    #[test]
+    fn jmp_indirect_follows_the_pointer() {
+        // The pointer at $0210 says $8005, where BRK waits; the LDA
+        // at $8003 gets jumped over.
+        let cpu = run_program_with(
+            &[0x6C, 0x10, 0x02, 0xA9, 0x63, 0x00],
+            &[(0x0210, 0x05), (0x0211, 0x80)],
+        );
+        assert_eq!(cpu.a, 0);
+    }
+
+    #[test]
+    fn jmp_indirect_obeys_the_page_edge_law() {
+        // Pointer at $02FF: low byte from $02FF, high byte from $0200 —
+        // NOT $0300. A decoy program waits where a wrong answer leads.
+        let cpu = run_program_with(
+            &[0x6C, 0xFF, 0x02, 0xA9, 0x63, 0x00],
+            &[
+                (0x02FF, 0x05),
+                (0x0200, 0x80),
+                (0x0300, 0x99),   // wrong high byte would send us to $9905...
+                (0x9905, 0xA9),   // ...where a decoy LDA #$42 tells on it.
+                (0x9906, 0x42),
+            ],
+        );
+        assert_eq!(cpu.a, 0);
     }
 }
