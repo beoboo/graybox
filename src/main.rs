@@ -1,3 +1,8 @@
+// Every file in `src/` is a "module": a drawer of related code.
+// This line tells Rust that the drawer `src/cpu.rs` exists and is part of
+// our program.
+mod cpu;
+
 use minifb::{Key, Scale, Window, WindowOptions};
 
 /// The NES picture is exactly 256 pixels wide...
