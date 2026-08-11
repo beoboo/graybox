@@ -1,6 +1,7 @@
 //! The bus — the wiring that decides which chip answers each address.
 
 use crate::cartridge::Cartridge;
+use crate::controller::Controller;
 use crate::ppu::Ppu;
 
 /// Everything on the far side of the CPU's read and write lines.
@@ -13,6 +14,9 @@ pub struct Bus {
 
     /// The picture chip, reachable through its eight registers.
     pub ppu: Ppu,
+
+    /// The first controller port.
+    pub controller: Controller,
 }
 
 impl Bus {
@@ -22,6 +26,7 @@ impl Bus {
             ram: [0; 2048],
             // Built before `cartridge` moves in, since it reads from it.
             ppu: Ppu::new(cartridge.vertical_mirroring),
+            controller: Controller::new(),
             cartridge,
         }
     }
@@ -47,7 +52,10 @@ impl Bus {
                 _ => 0,
             },
 
-            // Sound and input. Also nobody.
+            // The first controller: one button per read.
+            0x4016 => self.controller.read(),
+
+            // Sound registers, and the second controller port. Nobody.
             0x4000..=0x401F => 0,
 
             // Cartridge territory that NROM boards leave unwired.
@@ -70,6 +78,9 @@ impl Bus {
                 // chapters that need them.
                 _ => {}
             },
+
+            // The controller's strobe line.
+            0x4016 => self.controller.write(value),
 
             // Writes to ROM change nothing. The clue is in the name.
             0x8000..=0xFFFF => {}

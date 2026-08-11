@@ -8,6 +8,8 @@ mod cartridge;
 mod bus;
 // The picture chip.
 mod ppu;
+// The player's end of the machine.
+mod controller;
 
 use minifb::{Key, Scale, Window, WindowOptions};
 use cpu::Cpu;
@@ -67,6 +69,29 @@ fn main() {
         // paint what it described. The instruction counts are a crude
         // stand-in for real timing — chapter 18 earns the real thing.
         if let Some(cpu) = &mut machine {
+            // The keyboard becomes the controller — one key per
+            // button, in the console's own order: A, B, Select,
+            // Start, then the four directions.
+            let keys = [
+                Key::X,     // A
+                Key::Z,     // B
+                Key::Space, // Select
+                Key::Enter, // Start
+                Key::Up,
+                Key::Down,
+                Key::Left,
+                Key::Right,
+            ];
+
+            let mut buttons = 0;
+            for (bit, key) in keys.iter().enumerate() {
+                if window.is_key_down(*key) {
+                    buttons |= 1 << bit;
+                }
+            }
+
+            cpu.bus.controller.buttons = buttons;
+
             for _ in 0..10_000 {
                 cpu.step();
             }
