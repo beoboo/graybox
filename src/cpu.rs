@@ -25,6 +25,15 @@ pub struct Cpu {
     /// The status byte: eight tiny yes/no flags packed into one byte.
     pub status: u8,
 
+    /// The odometer: every cycle this CPU has ever spent, counted
+    /// from power-on. Time on the NES is measured HERE, not in
+    /// instructions — instructions come in different sizes.
+    pub cycles: u64,
+
+    /// Set by the indexed addressing modes when adding the index
+    /// stepped into the next page — the readers' one-cycle surcharge.
+    crossed: bool,
+
     /// The bus: everything the CPU can reach lives on its far side.
     pub bus: Bus,
 }
@@ -76,6 +85,40 @@ pub enum AddressingMode {
     IndirectY,
 }
 
+/// The price list: how many cycles each opcode costs, base rate.
+/// Same layout as the opcode map — row is the high digit, column the
+/// low. Three kinds of surcharge are billed separately: reads that
+/// cross a page, branches that jump, branches that jump FAR. A zero
+/// marks an opcode this CPU refuses.
+#[rustfmt::skip]
+const CYCLES: [u8; 256] = [
+    //  0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F
+        7, 6, 2, 0, 0, 3, 5, 0, 3, 2, 2, 0, 0, 4, 6, 0, // 0
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 1
+        6, 6, 0, 0, 3, 3, 5, 0, 4, 2, 2, 0, 4, 4, 6, 0, // 2
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 3
+        6, 6, 0, 0, 0, 3, 5, 0, 3, 2, 2, 0, 3, 4, 6, 0, // 4
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 5
+        6, 6, 0, 0, 0, 3, 5, 0, 4, 2, 2, 0, 5, 4, 6, 0, // 6
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 7
+        0, 6, 0, 0, 3, 3, 3, 0, 2, 0, 2, 0, 4, 4, 4, 0, // 8
+        2, 6, 0, 0, 4, 4, 4, 0, 2, 5, 2, 0, 0, 5, 0, 0, // 9
+        2, 6, 2, 0, 3, 3, 3, 0, 2, 2, 2, 0, 4, 4, 4, 0, // A
+        2, 5, 0, 0, 4, 4, 4, 0, 2, 4, 2, 0, 4, 4, 4, 0, // B
+        2, 6, 0, 0, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0, // C
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // D
+        2, 6, 0, 0, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0, // E
+        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // F
+];
+
+/// Do two addresses sit on different pages? A "page" is a 256-byte
+/// stretch of memory: same top byte, same page. The 6502 computes
+/// addresses a byte at a time, so stepping over a page edge means
+/// extra work for it — and surcharges for us.
+fn crosses_a_page(from: u16, to: u16) -> bool {
+    from & 0xFF00 != to & 0xFF00
+}
+
 impl Cpu {
     /// A CPU wired to a cartridge: pockets empty, RAM blank, the
     /// program waiting at the far end of the bus.
@@ -87,6 +130,8 @@ impl Cpu {
             pc: 0,
             sp: 0,
             status: 0,
+            cycles: 0,
+            crossed: false,
             bus: Bus::new(cartridge),
         }
     }
@@ -125,6 +170,10 @@ impl Cpu {
         // The reset vector: the address stored AT $FFFC tells the CPU
         // where its program begins. The CPU's first act is to read it.
         self.pc = self.read_word(0xFFFC);
+
+        // The reset sequence itself takes seven cycles before the
+        // first instruction runs. The odometer starts there.
+        self.cycles = 7;
     }
 
     /// Where does this instruction's value live? Every addressing mode
@@ -163,17 +212,22 @@ impl Cpu {
                 self.pc = self.pc.wrapping_add(2);
                 address
             }
-            // Absolute plus X: perfect for "element X of a list".
+            // Absolute plus X: perfect for "element X of a list" —
+            // and the mode that invented the crossing surcharge.
             AddressingMode::AbsoluteX => {
                 let base = self.read_word(self.pc);
                 self.pc = self.pc.wrapping_add(2);
-                base.wrapping_add(self.x as u16)
+                let address = base.wrapping_add(self.x as u16);
+                self.crossed = crosses_a_page(base, address);
+                address
             }
             // The same, with Y.
             AddressingMode::AbsoluteY => {
                 let base = self.read_word(self.pc);
                 self.pc = self.pc.wrapping_add(2);
-                base.wrapping_add(self.y as u16)
+                let address = base.wrapping_add(self.y as u16);
+                self.crossed = crosses_a_page(base, address);
+                address
             }
             // ($xx,X): add X to the zero-page spot, THEN follow the
             // pointer stored there. BOTH pointer bytes come from the
@@ -194,7 +248,12 @@ impl Cpu {
                 self.pc = self.pc.wrapping_add(1);
                 let low = self.read(base as u16) as u16;
                 let high = self.read(base.wrapping_add(1) as u16) as u16;
-                ((high << 8) | low).wrapping_add(self.y as u16)
+                // Adding Y here can cross a page, exactly like
+                // absolute-plus-Y — same surcharge.
+                let pointer = (high << 8) | low;
+                let address = pointer.wrapping_add(self.y as u16);
+                self.crossed = crosses_a_page(pointer, address);
+                address
             }
         }
     }
@@ -206,6 +265,11 @@ impl Cpu {
         // and move the program counter past it.
         let opcode = self.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
+
+        // Pay the base fare off the price list before doing the work.
+        // Surcharges, where they apply, get added along the way.
+        self.cycles += CYCLES[opcode as usize] as u64;
+        self.crossed = false;
 
         // DECODE and EXECUTE: recognize the opcode, do what it says.
         match opcode {
@@ -498,13 +562,31 @@ impl Cpu {
                 self.update_zero_and_negative(self.x);
             }
 
-            // BRK — simplified into a stop sign until interrupts arrive
-            // (chapter 18). The real thing is more interesting.
-            0x00 => return false,
+            // BRK — the software interrupt: the program taps its OWN
+            // shoulder. Push the address past BRK's padding byte, push
+            // the notes with the B flag raised, follow the vector at
+            // $FFFE. (RTI already knows the way back.)
+            0x00 => {
+                self.pc = self.pc.wrapping_add(1);
+                self.push_word(self.pc);
+                self.push(self.status | 0b0011_0000);
+                self.status |= FLAG_INTERRUPT_DISABLE;
+                self.pc = self.read_word(0xFFFE);
+            }
+
+            // JAM — an unofficial opcode that genuinely freezes a real
+            // 6502 until the reset button. Ours stops politely instead,
+            // and the test programs end on it.
+            0x02 => return false,
 
             // An opcode we don't implement. Stopping loudly beats
             // carrying on wrongly.
             _ => panic!("I don't know opcode {opcode:#04X} yet!"),
+        }
+
+        // Bill the page-crossing surcharge, for the reads that met one.
+        if self.crossed {
+            self.cycles += 1;
         }
 
         true
@@ -521,6 +603,11 @@ impl Cpu {
     /// No flags — storing changes memory, not the CPU's mood.
     fn sta(&mut self, mode: AddressingMode) {
         let address = self.operand_address(mode);
+
+        // Writers never pay the crossing surcharge — the price list
+        // charges them the worst case up front, crossing or not.
+        self.crossed = false;
+
         self.write(address, self.a);
     }
 
@@ -597,7 +684,15 @@ impl Cpu {
         self.pc = self.pc.wrapping_add(1);
 
         if condition {
-            self.pc = self.pc.wrapping_add(offset as u16);
+            // A branch NOT taken is the cheap case on the price list.
+            // Taking it costs one extra — and one more on top if the
+            // jump lands on a different page.
+            let target = self.pc.wrapping_add(offset as u16);
+            self.cycles += 1;
+            if crosses_a_page(self.pc, target) {
+                self.cycles += 1;
+            }
+            self.pc = target;
         }
     }
 
@@ -662,6 +757,10 @@ impl Cpu {
     /// name is a value you can pass around, like any other.
     fn modify(&mut self, mode: AddressingMode, worker: fn(&mut Cpu, u8) -> u8) {
         let address = self.operand_address(mode);
+
+        // Read-modify-write pays the worst case up front, like STA.
+        self.crossed = false;
+
         let value = self.read(address);
         let result = worker(self, value);
         self.write(address, result);
@@ -834,6 +933,9 @@ impl Cpu {
         self.push((self.status | 0b0010_0000) & !0b0001_0000);
         self.status |= FLAG_INTERRUPT_DISABLE;
         self.pc = self.read_word(0xFFFA);
+
+        // Taking an interrupt is not free: seven cycles, same as BRK.
+        self.cycles += 7;
     }
 
     /// Every official opcode's name and total length in bytes — the
@@ -969,6 +1071,13 @@ mod tests {
         prg[..program.len()].copy_from_slice(program);
         prg[0x3FFC] = 0x00; // the reset vector: $8000, little end first
         prg[0x3FFD] = 0x80;
+
+        // BRK follows the IRQ vector now, so test programs need
+        // somewhere to land: $9000 holds a JAM, the true full stop.
+        prg[0x1000] = 0x02;
+        prg[0x3FFE] = 0x00; // the IRQ vector: $9000
+        prg[0x3FFF] = 0x90;
+
         Cartridge {
             prg_rom: prg,
             chr_rom: Vec::new(),
@@ -1259,7 +1368,10 @@ mod tests {
         // and SP steps down to $FC.
         let cpu = run_program(&[0xA9, 0x07, 0x48, 0x00]);
         assert_eq!(cpu.read(0x01FD), 7);
-        assert_eq!(cpu.sp, 0xFC);
+        // The program's own push left SP at $FC — and then the BRK
+        // that ends every test program pushed its three goodbye
+        // bytes on top. $FC minus three.
+        assert_eq!(cpu.sp, 0xF9);
     }
 
     #[test]
@@ -1306,9 +1418,9 @@ mod tests {
             0xA9, 0x0A, 0x48, // LDA #$0A, PHA — address, little half
             0xA9, 0x02, 0x48, // LDA #$02, PHA — a status with Z raised
             0x40, // RTI
-            0x00, // $800A: BRK
+            0x02, // $800A: JAM — since BRK grew up, the honest stop
         ]);
-        assert_eq!(cpu.pc, 0x800B); // the BRK at $800A fetched, stopped
+        assert_eq!(cpu.pc, 0x800B); // the JAM at $800A fetched, stopped
         assert!(cpu.status & FLAG_ZERO != 0); // the pulled Z came back
     }
 
@@ -1553,5 +1665,80 @@ mod tests {
         cpu.write(0x4014, 0x08);
 
         assert_eq!(cpu.bus.ppu.oam[0], 0xAB);
+    }
+
+    #[test]
+    fn the_odometer_starts_at_reset_and_charges_the_list_price() {
+        let mut cpu = Cpu::new(test_cartridge(&[0xA9, 0x07]));
+        cpu.reset();
+        assert_eq!(cpu.cycles, 7); // the reset sequence itself
+
+        cpu.step();
+        assert_eq!(cpu.cycles, 7 + 2); // LDA #, two off the list
+    }
+
+    #[test]
+    fn a_read_that_crosses_the_page_pays_one_extra() {
+        // LDA $80F0,X with X=$20 lands on $8110 — the next page:
+        // four off the list, plus the surcharge.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA2, 0x20, 0xBD, 0xF0, 0x80]));
+        cpu.reset();
+        cpu.step(); // LDX #$20: two cycles
+
+        cpu.step();
+        assert_eq!(cpu.cycles, 7 + 2 + 4 + 1);
+    }
+
+    #[test]
+    fn a_store_never_pays_the_crossing_toll() {
+        // STA across the very same page edge: five, flat. The list
+        // charges writers the worst case whether they cross or not.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA2, 0x20, 0x9D, 0xF0, 0x80]));
+        cpu.reset();
+        cpu.step();
+
+        cpu.step();
+        assert_eq!(cpu.cycles, 7 + 2 + 5);
+    }
+
+    #[test]
+    fn a_taken_branch_costs_one_more_and_a_far_one_two() {
+        // Not taken (LDA #0 raises Z, BNE declines): the flat two.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA9, 0x00, 0xD0, 0x10]));
+        cpu.reset();
+        cpu.step();
+        let before = cpu.cycles;
+        cpu.step();
+        assert_eq!(cpu.cycles - before, 2);
+
+        // Taken, landing nearby: two plus one.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA9, 0x00, 0xF0, 0x10]));
+        cpu.reset();
+        cpu.step();
+        let before = cpu.cycles;
+        cpu.step();
+        assert_eq!(cpu.cycles - before, 3);
+
+        // Taken backwards past $8000, onto the previous page: four.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA9, 0x00, 0xF0, 0xF0]));
+        cpu.reset();
+        cpu.step();
+        let before = cpu.cycles;
+        cpu.step();
+        assert_eq!(cpu.cycles - before, 4);
+    }
+
+    #[test]
+    fn brk_pushes_its_note_and_follows_the_irq_vector() {
+        let mut cpu = Cpu::new(test_cartridge(&[0x00]));
+        cpu.reset();
+
+        cpu.step();
+
+        assert_eq!(cpu.pc, 0x9000); // where the vector points
+        assert_eq!(cpu.read(0x01FD), 0x80); // the pushed address is
+        assert_eq!(cpu.read(0x01FC), 0x02); // $8002 — PAST the pad byte
+        assert!(cpu.read(0x01FB) & 0b0001_0000 != 0); // B flag raised
+        assert!(cpu.status & FLAG_INTERRUPT_DISABLE != 0);
     }
 }

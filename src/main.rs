@@ -64,10 +64,13 @@ fn main() {
     // Show the buffer, over and over, until the window is closed
     // or Esc is pressed.
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // One trip around this loop is one frame: the game computes
-        // while the "beam" draws, rests briefly in vblank, and then we
-        // paint what it described. The instruction counts are a crude
-        // stand-in for real timing — chapter 18 earns the real thing.
+        // One trip around this loop is one frame, measured the way the
+        // console measures it: in cycles. The beam paints for 241
+        // scanlines, rests for 21 — and at 341 dots a line, 3 dots a
+        // cycle, that is the whole arithmetic of a television frame.
+        const VISIBLE_CYCLES: u64 = 241 * 341 / 3; // 27,393
+        const VBLANK_CYCLES: u64 = 21 * 341 / 3; // 2,387
+
         if let Some(cpu) = &mut machine {
             // The keyboard becomes the controller — one key per
             // button, in the console's own order: A, B, Select,
@@ -92,19 +95,27 @@ fn main() {
 
             cpu.bus.controller.buttons = buttons;
 
-            for _ in 0..10_000 {
+            // The visible part: the beam paints, the game computes.
+            let visible_until = cpu.cycles + VISIBLE_CYCLES;
+            while cpu.cycles < visible_until {
                 cpu.step();
             }
+
+            // The beam rests; vblank begins, and a game that armed
+            // PPUCTRL bit 7 gets it hand-delivered by the NMI.
             cpu.bus.ppu.vblank.set(true);
-            // A game that armed PPUCTRL bit 7 gets vblank hand-delivered:
-            // the tap on the shoulder. (Its handler ends in RTI — which
-            // chapter 12's grader made us build. Everything connects.)
             if cpu.bus.ppu.ctrl & 0b1000_0000 != 0 {
                 cpu.nmi();
             }
-            for _ in 0..1_000 {
+            let vblank_until = cpu.cycles + VBLANK_CYCLES;
+            while cpu.cycles < vblank_until {
                 cpu.step();
             }
+
+            // The rest is over — the flag drops whether or not anyone
+            // ever came to read it.
+            cpu.bus.ppu.vblank.set(false);
+
             render_background(cpu, &mut buffer);
             render_sprites(cpu, &mut buffer);
         }
@@ -307,13 +318,14 @@ fn nestest_diff(rom_path: &str, log_path: &str) {
 
     let mut matched = 0;
     for line in golden.lines() {
-        // The fields both sides have: PC and the five pockets. (The log
-        // also carries cycle counts — a Part II subject.)
+        // PC, the five pockets — and now the odometer. The golden
+        // log's last column has waited six chapters for this.
         let ours = format!(
-            "{:04X} A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}",
-            cpu.pc, cpu.a, cpu.x, cpu.y, cpu.status, cpu.sp
+            "{:04X} A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X} CYC:{}",
+            cpu.pc, cpu.a, cpu.x, cpu.y, cpu.status, cpu.sp, cpu.cycles
         );
-        let theirs = format!("{} {}", &line[0..4], &line[48..73]);
+        let golden_cycles = line.split("CYC:").nth(1).unwrap_or("?");
+        let theirs = format!("{} {} CYC:{}", &line[0..4], &line[48..73], golden_cycles);
 
         if ours != theirs {
             println!("MISMATCH after {matched} matching lines.");
