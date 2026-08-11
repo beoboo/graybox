@@ -9,7 +9,7 @@ mod bus;
 // The picture chip.
 mod ppu;
 
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use cpu::Cpu;
 use cartridge::Cartridge;
 
@@ -18,6 +18,15 @@ const WIDTH: usize = 256;
 
 /// ...and 240 pixels tall.
 const HEIGHT: usize = 240;
+
+/// A few palettes to try on the album: each picks four crayons from the
+/// system palette. Real games keep eight of these at once (chapter 15).
+const SAMPLE_PALETTES: [[u8; 4]; 4] = [
+    [0x0F, 0x2D, 0x10, 0x30], // grays — chapter 13, now official
+    [0x0F, 0x06, 0x16, 0x27], // embers
+    [0x0F, 0x01, 0x21, 0x31], // sky
+    [0x0F, 0x09, 0x19, 0x29], // forest
+];
 
 fn main() {
     // One path on the command line boots a machine — and now we KEEP it.
@@ -36,10 +45,14 @@ fn main() {
     // 0 means black, so right now this is a picture of nothing.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
 
-    // A machine in hand? Show its cartridge's art. Otherwise, the
-    // trusty test pattern.
+    // A machine in hand? Dress its album in the first sample palette.
+    let mut palette_index = 0;
     match &machine {
-        Some(cpu) => draw_pattern_tables(&cpu.bus.cartridge.chr_rom, &mut buffer),
+        Some(cpu) => draw_pattern_tables(
+            &cpu.bus.cartridge.chr_rom,
+            &SAMPLE_PALETTES[palette_index],
+            &mut buffer,
+        ),
         None => {
             draw_test_pattern(&mut buffer);
             draw_tile_grid(&mut buffer);
@@ -65,6 +78,18 @@ fn main() {
     // Show the buffer, over and over, until the window is closed
     // or Esc is pressed.
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Space tries the next palette on the album.
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
+            if let Some(cpu) = &machine {
+                palette_index = (palette_index + 1) % SAMPLE_PALETTES.len();
+                draw_pattern_tables(
+                    &cpu.bus.cartridge.chr_rom,
+                    &SAMPLE_PALETTES[palette_index],
+                    &mut buffer,
+                );
+            }
+        }
+
         window
             .update_with_buffer(&buffer, WIDTH, HEIGHT)
             .expect("could not draw to the window");
@@ -141,12 +166,10 @@ fn boot_rom(path: &str) -> Cpu {
     cpu
 }
 
-/// Draw every tile in CHR ROM, in four grays: pattern table 0 on the
-/// left, pattern table 1 on the right. The game's whole sticker album.
-fn draw_pattern_tables(chr: &[u8], buffer: &mut [u32]) {
-    // The four pixel values, darkest to lightest.
-    const GRAYS: [u32; 4] = [0x0000_0000, 0x0055_5555, 0x00AA_AAAA, 0x00FF_FFFF];
-
+/// Draw every tile in CHR ROM through a palette: each pixel value picks
+/// a crayon, each crayon picks a color from the big box. Pattern table
+/// 0 on the left, table 1 on the right.
+fn draw_pattern_tables(chr: &[u8], palette: &[u8; 4], buffer: &mut [u32]) {
     for table in 0..2 {
         for tile in 0..256 {
             let pixels = ppu::decode_tile(chr, table * 256 + tile);
@@ -158,7 +181,8 @@ fn draw_pattern_tables(chr: &[u8], buffer: &mut [u32]) {
 
             for row in 0..8 {
                 for col in 0..8 {
-                    let color = GRAYS[pixels[row][col] as usize];
+                    let crayon = palette[pixels[row][col] as usize];
+                    let color = ppu::SYSTEM_PALETTE[crayon as usize];
                     buffer[(corner_y + row) * WIDTH + corner_x + col] = color;
                 }
             }
