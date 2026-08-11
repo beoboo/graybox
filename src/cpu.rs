@@ -26,12 +26,20 @@ pub struct Cpu {
     pub memory: [u8; 65536],
 }
 
+/// The Carry flag: the ninth bit of the last addition — and, for
+/// subtraction and comparing, the "no borrow needed" signal.
+pub const FLAG_CARRY: u8 = 0b0000_0001;
+
 /// The Zero flag: switched on when the last value the CPU handled was zero.
 pub const FLAG_ZERO: u8 = 0b0000_0010;
 
 /// The Negative flag: a copy of the top bit — the sign bit — of the
 /// last value the CPU handled.
 pub const FLAG_NEGATIVE: u8 = 0b1000_0000;
+
+/// The Overflow flag: the addition's answer landed on the wrong side of
+/// zero — a signed-arithmetic accident the Carry can't see.
+pub const FLAG_OVERFLOW: u8 = 0b0100_0000;
 
 /// The ways an instruction can say WHERE its value lives.
 /// (`Clone, Copy` lets us hand modes around as freely as numbers.)
@@ -195,6 +203,66 @@ impl Cpu {
             0x81 => self.sta(AddressingMode::IndirectX),
             0x91 => self.sta(AddressingMode::IndirectY),
 
+            // ADC — add, in all the flavors LDA taught us.
+            0x69 => self.adc(AddressingMode::Immediate),
+            0x65 => self.adc(AddressingMode::ZeroPage),
+            0x75 => self.adc(AddressingMode::ZeroPageX),
+            0x6D => self.adc(AddressingMode::Absolute),
+            0x7D => self.adc(AddressingMode::AbsoluteX),
+            0x79 => self.adc(AddressingMode::AbsoluteY),
+            0x61 => self.adc(AddressingMode::IndirectX),
+            0x71 => self.adc(AddressingMode::IndirectY),
+
+            // CLC / SEC — CLear and SEt the Carry by hand. Every fresh
+            // chained addition starts CLC; every subtraction, SEC.
+            0x18 => self.status &= !FLAG_CARRY,
+            0x38 => self.status |= FLAG_CARRY,
+
+            // SBC — subtract, same flavors again.
+            0xE9 => self.sbc(AddressingMode::Immediate),
+            0xE5 => self.sbc(AddressingMode::ZeroPage),
+            0xF5 => self.sbc(AddressingMode::ZeroPageX),
+            0xED => self.sbc(AddressingMode::Absolute),
+            0xFD => self.sbc(AddressingMode::AbsoluteX),
+            0xF9 => self.sbc(AddressingMode::AbsoluteY),
+            0xE1 => self.sbc(AddressingMode::IndirectX),
+            0xF1 => self.sbc(AddressingMode::IndirectY),
+
+            // CMP — compare with A...
+            0xC9 => self.compare(AddressingMode::Immediate, self.a),
+            0xC5 => self.compare(AddressingMode::ZeroPage, self.a),
+            0xD5 => self.compare(AddressingMode::ZeroPageX, self.a),
+            0xCD => self.compare(AddressingMode::Absolute, self.a),
+            0xDD => self.compare(AddressingMode::AbsoluteX, self.a),
+            0xD9 => self.compare(AddressingMode::AbsoluteY, self.a),
+            0xC1 => self.compare(AddressingMode::IndirectX, self.a),
+            0xD1 => self.compare(AddressingMode::IndirectY, self.a),
+
+            // ...CPX, with X...
+            0xE0 => self.compare(AddressingMode::Immediate, self.x),
+            0xE4 => self.compare(AddressingMode::ZeroPage, self.x),
+            0xEC => self.compare(AddressingMode::Absolute, self.x),
+
+            // ...and CPY, with Y.
+            0xC0 => self.compare(AddressingMode::Immediate, self.y),
+            0xC4 => self.compare(AddressingMode::ZeroPage, self.y),
+            0xCC => self.compare(AddressingMode::Absolute, self.y),
+
+            // JMP — JuMP: put a new address straight into PC. That is
+            // all "going somewhere else" ever was.
+            0x4C => self.pc = self.operand_address(AddressingMode::Absolute),
+
+            // The branch family — Branch if...: each one tests a single
+            // flag, one way.
+            0xD0 => self.branch_if(self.status & FLAG_ZERO == 0), // BNE - not equal
+            0xF0 => self.branch_if(self.status & FLAG_ZERO != 0), // BEQ - equal
+            0x90 => self.branch_if(self.status & FLAG_CARRY == 0), // BCC - carry clear
+            0xB0 => self.branch_if(self.status & FLAG_CARRY != 0), // BCS - carry set
+            0x10 => self.branch_if(self.status & FLAG_NEGATIVE == 0), // BPL - plus
+            0x30 => self.branch_if(self.status & FLAG_NEGATIVE != 0), // BMI - minus
+            0x50 => self.branch_if(self.status & FLAG_OVERFLOW == 0), // BVC
+            0x70 => self.branch_if(self.status & FLAG_OVERFLOW != 0), // BVS
+
             // TAX — Transfer A to X. A keeps its value; X gets a copy.
             0xAA => {
                 self.x = self.a;
@@ -233,6 +301,83 @@ impl Cpu {
     fn sta(&mut self, mode: AddressingMode) {
         let address = self.operand_address(mode);
         self.write(address, self.a);
+    }
+
+    /// ADC — ADd with Carry: the 6502's one and only addition.
+    fn adc(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.add_to_a(value);
+    }
+
+    /// The shared heart of addition and subtraction: add a value into A
+    /// and take all the notes.
+    fn add_to_a(&mut self, value: u8) {
+        // The Carry from last time joins the sum — that's what lets
+        // additions chain into numbers bigger than one byte.
+        let carry_in: u16 = if self.status & FLAG_CARRY != 0 { 1 } else { 0 };
+        let sum = self.a as u16 + value as u16 + carry_in;
+
+        // The answer's ninth bit doesn't fit an 8-bit pocket:
+        // it lands in the Carry flag.
+        if sum > 0xFF {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+
+        let result = sum as u8;
+
+        // Overflow: both inputs sat on one side of zero and the answer
+        // landed on the other. The top bit is the sign, so: if A and the
+        // value agreed with each other and the result disagrees, that's
+        // an accident worth a flag.
+        if (self.a ^ result) & (value ^ result) & 0x80 != 0 {
+            self.status |= FLAG_OVERFLOW;
+        } else {
+            self.status &= !FLAG_OVERFLOW;
+        }
+
+        self.a = result;
+        self.update_zero_and_negative(self.a);
+    }
+
+    /// SBC — SuBtract with Carry. Subtraction is addition in disguise:
+    /// flip every bit of the value and add it. The missing "+1" of the
+    /// disguise comes in through the Carry — which is why every fresh
+    /// subtraction starts with SEC.
+    fn sbc(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.add_to_a(value ^ 0xFF);
+    }
+
+    /// CMP — CoMPare A — with CPX and CPY for the other pockets: a
+    /// subtraction that throws the answer away and keeps only the
+    /// notes. Carry means "no borrow was needed" — in other words,
+    /// register >= value.
+    fn compare(&mut self, mode: AddressingMode, register: u8) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+
+        if register >= value {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        self.update_zero_and_negative(register.wrapping_sub(value));
+    }
+
+    /// The heart of every branch: maybe move PC, by a SIGNED offset.
+    /// (`as i8` reads the byte as -128..=127; the second `as` stretches
+    /// it back to 16 bits, minus sign and all.)
+    fn branch_if(&mut self, condition: bool) {
+        let offset = self.read(self.pc) as i8;
+        self.pc = self.pc.wrapping_add(1);
+
+        if condition {
+            self.pc = self.pc.wrapping_add(offset as u16);
+        }
     }
 
     /// Almost every instruction ends the same way: the CPU looks at the
@@ -439,5 +584,91 @@ mod tests {
         // LDA #$42, STA $0250.
         let cpu = run_program(&[0xA9, 0x42, 0x8D, 0x50, 0x02, 0x00]);
         assert_eq!(cpu.read(0x0250), 0x42);
+    }
+
+    #[test]
+    fn adc_adds() {
+        // LDA #2, ADC #3. Carry starts clear after reset.
+        let cpu = run_program(&[0xA9, 0x02, 0x69, 0x03, 0x00]);
+        assert_eq!(cpu.a, 5);
+        assert!(cpu.status & FLAG_CARRY == 0);
+    }
+
+    #[test]
+    fn adc_catches_the_ninth_bit() {
+        // LDA #$FF, ADC #1 — the answer is 256: too big for the pocket.
+        let cpu = run_program(&[0xA9, 0xFF, 0x69, 0x01, 0x00]);
+        assert_eq!(cpu.a, 0);
+        assert!(cpu.status & FLAG_CARRY != 0);
+        assert!(cpu.status & FLAG_ZERO != 0);
+    }
+
+    #[test]
+    fn adc_lets_the_carry_back_in() {
+        // SEC first: 2 + 3 + 1 = 6.
+        let cpu = run_program(&[0x38, 0xA9, 0x02, 0x69, 0x03, 0x00]);
+        assert_eq!(cpu.a, 6);
+    }
+
+    #[test]
+    fn adc_flags_a_signed_accident() {
+        // 80 + 80 = 160 — but as SIGNED bytes, 80 + 80 can't be -96.
+        let cpu = run_program(&[0xA9, 0x50, 0x69, 0x50, 0x00]);
+        assert_eq!(cpu.a, 0xA0);
+        assert!(cpu.status & FLAG_OVERFLOW != 0);
+    }
+
+    #[test]
+    fn sbc_subtracts() {
+        // SEC, LDA #9, SBC #4. Carry still set: no borrow was needed.
+        let cpu = run_program(&[0x38, 0xA9, 0x09, 0xE9, 0x04, 0x00]);
+        assert_eq!(cpu.a, 5);
+        assert!(cpu.status & FLAG_CARRY != 0);
+    }
+
+    #[test]
+    fn sbc_below_zero_wraps_and_drops_the_carry() {
+        // SEC, LDA #4, SBC #9: 4 - 9 = -5, which a pocket shows as $FB.
+        let cpu = run_program(&[0x38, 0xA9, 0x04, 0xE9, 0x09, 0x00]);
+        assert_eq!(cpu.a, 0xFB);
+        assert!(cpu.status & FLAG_CARRY == 0); // a borrow was needed
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+    }
+
+    #[test]
+    fn cmp_equal_sets_zero_and_carry() {
+        // LDA #7, CMP #7.
+        let cpu = run_program(&[0xA9, 0x07, 0xC9, 0x07, 0x00]);
+        assert!(cpu.status & FLAG_ZERO != 0);
+        assert!(cpu.status & FLAG_CARRY != 0);
+        assert_eq!(cpu.a, 7); // comparing never changes A
+    }
+
+    #[test]
+    fn cmp_smaller_clears_the_carry() {
+        // LDA #4, CMP #9 — a borrow would be needed.
+        let cpu = run_program(&[0xA9, 0x04, 0xC9, 0x09, 0x00]);
+        assert!(cpu.status & FLAG_CARRY == 0);
+    }
+
+    #[test]
+    fn jmp_skips_what_it_jumps_over() {
+        // JMP $8005 leaps over LDA #$63; A stays 0.
+        let cpu = run_program(&[0x4C, 0x05, 0x80, 0xA9, 0x63, 0x00]);
+        assert_eq!(cpu.a, 0);
+    }
+
+    #[test]
+    fn beq_branches_when_zero_is_set() {
+        // LDA #0 sets Z; BEQ +2 leaps over LDA #$63.
+        let cpu = run_program(&[0xA9, 0x00, 0xF0, 0x02, 0xA9, 0x63, 0x00]);
+        assert_eq!(cpu.a, 0);
+    }
+
+    #[test]
+    fn a_loop_counts_to_three() {
+        // A loop: INX / CPX #3 / BNE, round and round until X hits 3.
+        let cpu = run_program(&[0xA9, 0x00, 0xAA, 0xE8, 0xE0, 0x03, 0xD0, 0xFB, 0x00]);
+        assert_eq!(cpu.x, 3);
     }
 }

@@ -94,16 +94,17 @@ fn draw_tile_grid(buffer: &mut [u32]) {
 /// Load a little machine-code program, wake the CPU, run it to the end,
 /// and print every pocket after every instruction.
 fn cpu_demo() {
-    // A value takes a round trip through memory: into address $0010,
-    // then A is wiped clean, then the value comes back.
+    // A program that goes BACKWARDS: count X up to three, by looping
+    // over the same instructions.
     //
     // bytes    meaning
-    // A9 2A    LDA #42    put 42 into A
-    // 85 10    STA $10    store A at address $0010
-    // A9 00    LDA #0     wipe A clean
-    // A5 10    LDA $10    bring the 42 back
-    // 00       BRK        stop
-    let program = [0xA9, 0x2A, 0x85, 0x10, 0xA9, 0x00, 0xA5, 0x10, 0x00];
+    // A9 00    LDA #0     start A at zero
+    // AA       TAX        X = 0 too
+    // E8       INX        add 1 to X          <-- $8003, the loop target
+    // E0 03    CPX #3     is X 3 yet?
+    // D0 FB    BNE -5     not yet? back to INX
+    // 00       BRK        done: stop
+    let program = [0xA9, 0x00, 0xAA, 0xE8, 0xE0, 0x03, 0xD0, 0xFB, 0x00];
 
     let mut cpu = Cpu::new();
 
