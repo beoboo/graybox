@@ -33,6 +33,28 @@ pub const FLAG_ZERO: u8 = 0b0000_0010;
 /// last value the CPU handled.
 pub const FLAG_NEGATIVE: u8 = 0b1000_0000;
 
+/// The ways an instruction can say WHERE its value lives.
+/// (`Clone, Copy` lets us hand modes around as freely as numbers.)
+#[derive(Clone, Copy)]
+pub enum AddressingMode {
+    /// The value sits right after the opcode, in the program itself.
+    Immediate,
+    /// One byte names an address in the first 256 — the "zero page".
+    ZeroPage,
+    /// Zero page, then add X.
+    ZeroPageX,
+    /// A full two-byte address. Anywhere in memory.
+    Absolute,
+    /// Absolute, then add X.
+    AbsoluteX,
+    /// Absolute, then add Y.
+    AbsoluteY,
+    /// ($xx,X): add X to a zero-page spot; a POINTER waits there.
+    IndirectX,
+    /// ($xx),Y: a pointer waits at a zero-page spot; add Y afterwards.
+    IndirectY,
+}
+
 impl Cpu {
     /// A brand-new CPU: every pocket empty, every byte of memory zero.
     pub fn new() -> Cpu {
@@ -83,6 +105,66 @@ impl Cpu {
         self.pc = self.read_word(0xFFFC);
     }
 
+    /// Where does this instruction's value live? Every addressing mode
+    /// answers differently. This function does the finding, and moves PC
+    /// past whatever bytes the mode used up.
+    fn operand_address(&mut self, mode: AddressingMode) -> u16 {
+        match mode {
+            // The value's address IS where PC points. Note it, step past.
+            AddressingMode::Immediate => {
+                let address = self.pc;
+                self.pc = self.pc.wrapping_add(1);
+                address
+            }
+            // One byte, naming one of the first 256 addresses.
+            AddressingMode::ZeroPage => {
+                let address = self.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                address
+            }
+            // Zero page plus X — and the sum wraps WITHIN the page:
+            // $FF + 2 lands on $01, never on $101.
+            AddressingMode::ZeroPageX => {
+                let base = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                base.wrapping_add(self.x) as u16
+            }
+            // Two bytes, little end first — a full address.
+            AddressingMode::Absolute => {
+                let address = self.read_word(self.pc);
+                self.pc = self.pc.wrapping_add(2);
+                address
+            }
+            // Absolute plus X: perfect for "element X of a list".
+            AddressingMode::AbsoluteX => {
+                let base = self.read_word(self.pc);
+                self.pc = self.pc.wrapping_add(2);
+                base.wrapping_add(self.x as u16)
+            }
+            // The same, with Y.
+            AddressingMode::AbsoluteY => {
+                let base = self.read_word(self.pc);
+                self.pc = self.pc.wrapping_add(2);
+                base.wrapping_add(self.y as u16)
+            }
+            // ($xx,X): add X to the zero-page spot, THEN follow the
+            // pointer stored there.
+            AddressingMode::IndirectX => {
+                let base = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                let pointer = base.wrapping_add(self.x) as u16;
+                self.read_word(pointer)
+            }
+            // ($xx),Y: follow the pointer at the zero-page spot, THEN
+            // add Y to wherever it led.
+            AddressingMode::IndirectY => {
+                let base = self.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                self.read_word(base).wrapping_add(self.y as u16)
+            }
+        }
+    }
+
     /// Run ONE instruction: fetch it, decode it, execute it.
     /// Returns `false` when the program says stop, `true` otherwise.
     pub fn step(&mut self) -> bool {
@@ -93,13 +175,25 @@ impl Cpu {
 
         // DECODE and EXECUTE: recognize the opcode, do what it says.
         match opcode {
-            // LDA #value — LoaD A with the byte right after the opcode.
-            0xA9 => {
-                let value = self.read(self.pc);
-                self.pc = self.pc.wrapping_add(1);
-                self.a = value;
-                self.update_zero_and_negative(self.a);
-            }
+            // LDA, in every flavor the 6502 sells it.
+            0xA9 => self.lda(AddressingMode::Immediate),
+            0xA5 => self.lda(AddressingMode::ZeroPage),
+            0xB5 => self.lda(AddressingMode::ZeroPageX),
+            0xAD => self.lda(AddressingMode::Absolute),
+            0xBD => self.lda(AddressingMode::AbsoluteX),
+            0xB9 => self.lda(AddressingMode::AbsoluteY),
+            0xA1 => self.lda(AddressingMode::IndirectX),
+            0xB1 => self.lda(AddressingMode::IndirectY),
+
+            // STA — STore A into memory. Same flavors, minus Immediate:
+            // "store into the program itself" is not a thing the 6502 sells.
+            0x85 => self.sta(AddressingMode::ZeroPage),
+            0x95 => self.sta(AddressingMode::ZeroPageX),
+            0x8D => self.sta(AddressingMode::Absolute),
+            0x9D => self.sta(AddressingMode::AbsoluteX),
+            0x99 => self.sta(AddressingMode::AbsoluteY),
+            0x81 => self.sta(AddressingMode::IndirectX),
+            0x91 => self.sta(AddressingMode::IndirectY),
 
             // TAX — Transfer A to X. A keeps its value; X gets a copy.
             0xAA => {
@@ -125,6 +219,20 @@ impl Cpu {
         }
 
         true
+    }
+
+    /// LDA, any flavor: find the value, load it into A, take notes.
+    fn lda(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.a = self.read(address);
+        self.update_zero_and_negative(self.a);
+    }
+
+    /// STA, any flavor: find the address, store A there.
+    /// No flags — storing changes memory, not the CPU's mood.
+    fn sta(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.write(address, self.a);
     }
 
     /// Almost every instruction ends the same way: the CPU looks at the
@@ -230,5 +338,106 @@ mod tests {
         let cpu = run_program(&[0xA9, 0xFF, 0xAA, 0xE8, 0x00]);
         assert_eq!(cpu.x, 0);
         assert!(cpu.status & FLAG_ZERO != 0);
+    }
+
+    /// Like `run_program`, but first plant some values in memory —
+    /// the addressing modes need something to find.
+    fn run_program_with(program: &[u8], plants: &[(u16, u8)]) -> Cpu {
+        let mut cpu = Cpu::new();
+        for (i, byte) in program.iter().enumerate() {
+            cpu.write(0x8000 + i as u16, *byte);
+        }
+        for (address, value) in plants {
+            cpu.write(*address, *value);
+        }
+        cpu.write(0xFFFC, 0x00);
+        cpu.write(0xFFFD, 0x80);
+        cpu.reset();
+
+        while cpu.step() {}
+        cpu
+    }
+
+    #[test]
+    fn lda_zero_page_reads_from_the_first_page() {
+        // LDA $10 — the byte planted at $0010 lands in A.
+        let cpu = run_program_with(&[0xA5, 0x10, 0x00], &[(0x0010, 0x2A)]);
+        assert_eq!(cpu.a, 0x2A);
+    }
+
+    #[test]
+    fn lda_zero_page_x_wraps_inside_the_page() {
+        // X = 2 (via TAX), then LDA $FF,X — $FF + 2 wraps to $01.
+        let cpu = run_program_with(&[0xA9, 0x02, 0xAA, 0xB5, 0xFF, 0x00], &[(0x0001, 0x77)]);
+        assert_eq!(cpu.a, 0x77);
+    }
+
+    #[test]
+    fn lda_absolute_reads_anywhere() {
+        // LDA $0234.
+        let cpu = run_program_with(&[0xAD, 0x34, 0x02, 0x00], &[(0x0234, 0x55)]);
+        assert_eq!(cpu.a, 0x55);
+    }
+
+    #[test]
+    fn lda_absolute_x_adds_x() {
+        // A = X = 5 via TAX, then LDA $0200,X reads $0205.
+        let cpu = run_program_with(
+            &[0xA9, 0x05, 0xAA, 0xBD, 0x00, 0x02, 0x00],
+            &[(0x0205, 0x11)],
+        );
+        assert_eq!(cpu.a, 0x11);
+    }
+
+    #[test]
+    fn lda_absolute_y_adds_y() {
+        // The test sets Y by hand — robots may reach anywhere.
+        let mut cpu = Cpu::new();
+        for (i, byte) in [0xB9, 0x00, 0x02, 0x00].iter().enumerate() {
+            cpu.write(0x8000 + i as u16, *byte);
+        }
+        cpu.write(0x0205, 0x66);
+        cpu.write(0xFFFC, 0x00);
+        cpu.write(0xFFFD, 0x80);
+        cpu.reset();
+        cpu.y = 5;
+        while cpu.step() {}
+        assert_eq!(cpu.a, 0x66);
+    }
+
+    #[test]
+    fn lda_indirect_x_adds_x_then_follows_the_pointer() {
+        // X = 4 via TAX; ($1C,X) means the pointer waits at $20,
+        // and the pointer says $0300.
+        let cpu = run_program_with(
+            &[0xA9, 0x04, 0xAA, 0xA1, 0x1C, 0x00],
+            &[(0x0020, 0x00), (0x0021, 0x03), (0x0300, 0x88)],
+        );
+        assert_eq!(cpu.a, 0x88);
+    }
+
+    #[test]
+    fn lda_indirect_y_follows_the_pointer_then_adds_y() {
+        // The pointer at $20/$21 says $0300; Y adds 4; $0304 holds the prize.
+        let mut cpu = Cpu::new();
+        for (i, byte) in [0xB1, 0x20, 0x00].iter().enumerate() {
+            cpu.write(0x8000 + i as u16, *byte);
+        }
+        cpu.write(0x0020, 0x00); // pointer, little end
+        cpu.write(0x0021, 0x03); // pointer, big end
+        cpu.write(0x0304, 0x99);
+        cpu.write(0xFFFC, 0x00);
+        cpu.write(0xFFFD, 0x80);
+        cpu.reset();
+        cpu.y = 4;
+        while cpu.step() {}
+        assert_eq!(cpu.a, 0x99);
+    }
+
+    #[test]
+    fn sta_stores_a_into_memory() {
+        // LDA #$42, STA $0250.
+        let cpu = run_program(&[0xA9, 0x42, 0x8D, 0x50, 0x02, 0x00]);
+        assert_eq!(cpu.read(0x0250), 0x42);
     }
 }

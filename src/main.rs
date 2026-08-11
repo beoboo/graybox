@@ -94,15 +94,16 @@ fn draw_tile_grid(buffer: &mut [u32]) {
 /// Load a little machine-code program, wake the CPU, run it to the end,
 /// and print every pocket after every instruction.
 fn cpu_demo() {
-    // Our first program: six bytes.
+    // A value takes a round trip through memory: into address $0010,
+    // then A is wiped clean, then the value comes back.
     //
     // bytes    meaning
-    // A9 0A    LDA #10    put the number 10 into A
-    // AA       TAX        copy A into X
-    // E8       INX        add 1 to X
-    // E8       INX        add 1 to X
+    // A9 2A    LDA #42    put 42 into A
+    // 85 10    STA $10    store A at address $0010
+    // A9 00    LDA #0     wipe A clean
+    // A5 10    LDA $10    bring the 42 back
     // 00       BRK        stop
-    let program = [0xA9, 0x0A, 0xAA, 0xE8, 0xE8, 0x00];
+    let program = [0xA9, 0x2A, 0x85, 0x10, 0xA9, 0x00, 0xA5, 0x10, 0x00];
 
     let mut cpu = Cpu::new();
 
