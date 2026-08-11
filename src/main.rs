@@ -18,10 +18,13 @@ const WIDTH: usize = 256;
 const HEIGHT: usize = 240;
 
 fn main() {
-    // Handed a .nes file on the command line? Boot it.
-    // (`if let` is a one-armed match: do this only if there IS a value.)
-    if let Some(path) = std::env::args().nth(1) {
-        boot_rom(&path);
+    // One path on the command line boots it. A second path is a golden
+    // log to grade ourselves against.
+    let args: Vec<String> = std::env::args().collect();
+    match args.len() {
+        2 => boot_rom(&args[1]),
+        3 => nestest_diff(&args[1], &args[2]),
+        _ => {}
     }
 
     // The frame buffer: one number for every pixel on our screen.
@@ -116,11 +119,57 @@ fn boot_rom(path: &str) {
     let mut cpu = Cpu::new(cartridge);
     cpu.reset();
 
-    println!("  pc     a  x  y");
-    println!("  ---------------");
     for _ in 0..12 {
+        if let Some(line) = cpu.trace() {
+            println!("  {line}");
+        }
         cpu.step();
-        println!("  {:04X}   {:02X} {:02X} {:02X}", cpu.pc, cpu.a, cpu.x, cpu.y);
     }
     println!("  ...and on it goes.");
+}
+
+/// Run nestest in automation mode and grade our CPU against a golden
+/// log, line by line. The first difference is the truth.
+fn nestest_diff(rom_path: &str, log_path: &str) {
+    let bytes = std::fs::read(rom_path).expect("could not read the ROM");
+    let cartridge = Cartridge::load(&bytes).expect("could not parse the ROM");
+    let golden = std::fs::read_to_string(log_path).expect("could not read the log");
+
+    let mut cpu = Cpu::new(cartridge);
+    cpu.reset();
+    // nestest's automation mode: start at $C000 instead of the vector,
+    // and the tests run with no picture chip needed at all.
+    cpu.pc = 0xC000;
+
+    let mut matched = 0;
+    for line in golden.lines() {
+        // The fields both sides have: PC and the five pockets. (The log
+        // also carries cycle counts — a Part II subject.)
+        let ours = format!(
+            "{:04X} A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}",
+            cpu.pc, cpu.a, cpu.x, cpu.y, cpu.status, cpu.sp
+        );
+        let theirs = format!("{} {}", &line[0..4], &line[48..73]);
+
+        if ours != theirs {
+            println!("MISMATCH after {matched} matching lines.");
+            println!("  golden: {theirs}");
+            println!("  ours:   {ours}");
+            println!("  the golden line in full:");
+            println!("  {line}");
+            return;
+        }
+        matched += 1;
+
+        if Cpu::opcode_name_and_length(cpu.read(cpu.pc)).is_none() {
+            println!(
+                "{matched} lines matched — then {:#04X}, an opcode we",
+                cpu.read(cpu.pc)
+            );
+            println!("don't implement. Unofficial. A Part II story.");
+            return;
+        }
+        cpu.step();
+    }
+    println!("all {matched} lines matched");
 }

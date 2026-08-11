@@ -176,19 +176,25 @@ impl Cpu {
                 base.wrapping_add(self.y as u16)
             }
             // ($xx,X): add X to the zero-page spot, THEN follow the
-            // pointer stored there.
+            // pointer stored there. BOTH pointer bytes come from the
+            // zero page: a pointer starting at $FF takes its second
+            // half from $00, never $0100. nestest taught us this one.
             AddressingMode::IndirectX => {
                 let base = self.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
-                let pointer = base.wrapping_add(self.x) as u16;
-                self.read_word(pointer)
+                let pointer = base.wrapping_add(self.x);
+                let low = self.read(pointer as u16) as u16;
+                let high = self.read(pointer.wrapping_add(1) as u16) as u16;
+                (high << 8) | low
             }
-            // ($xx),Y: follow the pointer at the zero-page spot, THEN
-            // add Y to wherever it led.
+            // ($xx),Y: follow the pointer at the zero-page spot — same
+            // wrap — THEN add Y to wherever it led.
             AddressingMode::IndirectY => {
-                let base = self.read(self.pc) as u16;
+                let base = self.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
-                self.read_word(base).wrapping_add(self.y as u16)
+                let low = self.read(base as u16) as u16;
+                let high = self.read(base.wrapping_add(1) as u16) as u16;
+                ((high << 8) | low).wrapping_add(self.y as u16)
             }
         }
     }
@@ -315,6 +321,17 @@ impl Cpu {
             0x60 => {
                 let return_address = self.pull_word();
                 self.pc = return_address.wrapping_add(1);
+            }
+
+            // RTI — ReTurn from Interrupt: pull the status notes back
+            // (ghost-bit manners, as with PLP), then pull the address —
+            // EXACTLY as saved, no +1. JSR pushes one short and RTS
+            // compensates; an interrupt pushes the true address, so RTI
+            // adds nothing. Two callers, two manners.
+            0x40 => {
+                let value = self.pull();
+                self.status = (value | 0b0010_0000) & !0b0001_0000;
+                self.pc = self.pull_word();
             }
 
             // LDX and LDY — every flavor each of them is sold in.
@@ -807,6 +824,127 @@ impl Cpu {
             self.status &= !FLAG_NEGATIVE;
         }
     }
+
+    /// Every official opcode's name and total length in bytes — the
+    /// decoder ring for the diary. `None` means unofficial.
+    pub fn opcode_name_and_length(opcode: u8) -> Option<(&'static str, u16)> {
+        Some(match opcode {
+            0xA9 | 0xA5 | 0xB5 | 0xA1 | 0xB1 => ("LDA", 2),
+            0xAD | 0xBD | 0xB9 => ("LDA", 3),
+            0xA2 | 0xA6 | 0xB6 => ("LDX", 2),
+            0xAE | 0xBE => ("LDX", 3),
+            0xA0 | 0xA4 | 0xB4 => ("LDY", 2),
+            0xAC | 0xBC => ("LDY", 3),
+
+            0x85 | 0x95 | 0x81 | 0x91 => ("STA", 2),
+            0x8D | 0x9D | 0x99 => ("STA", 3),
+            0x86 | 0x96 => ("STX", 2),
+            0x8E => ("STX", 3),
+            0x84 | 0x94 => ("STY", 2),
+            0x8C => ("STY", 3),
+
+            0xAA => ("TAX", 1),
+            0xA8 => ("TAY", 1),
+            0x8A => ("TXA", 1),
+            0x98 => ("TYA", 1),
+            0x9A => ("TXS", 1),
+            0xBA => ("TSX", 1),
+
+            0x69 | 0x65 | 0x75 | 0x61 | 0x71 => ("ADC", 2),
+            0x6D | 0x7D | 0x79 => ("ADC", 3),
+            0xE9 | 0xE5 | 0xF5 | 0xE1 | 0xF1 => ("SBC", 2),
+            0xED | 0xFD | 0xF9 => ("SBC", 3),
+
+            0xC9 | 0xC5 | 0xD5 | 0xC1 | 0xD1 => ("CMP", 2),
+            0xCD | 0xDD | 0xD9 => ("CMP", 3),
+            0xE0 | 0xE4 => ("CPX", 2),
+            0xEC => ("CPX", 3),
+            0xC0 | 0xC4 => ("CPY", 2),
+            0xCC => ("CPY", 3),
+
+            0xE6 | 0xF6 => ("INC", 2),
+            0xEE | 0xFE => ("INC", 3),
+            0xC6 | 0xD6 => ("DEC", 2),
+            0xCE | 0xDE => ("DEC", 3),
+            0xE8 => ("INX", 1),
+            0xC8 => ("INY", 1),
+            0xCA => ("DEX", 1),
+            0x88 => ("DEY", 1),
+
+            0x29 | 0x25 | 0x35 | 0x21 | 0x31 => ("AND", 2),
+            0x2D | 0x3D | 0x39 => ("AND", 3),
+            0x09 | 0x05 | 0x15 | 0x01 | 0x11 => ("ORA", 2),
+            0x0D | 0x1D | 0x19 => ("ORA", 3),
+            0x49 | 0x45 | 0x55 | 0x41 | 0x51 => ("EOR", 2),
+            0x4D | 0x5D | 0x59 => ("EOR", 3),
+            0x24 => ("BIT", 2),
+            0x2C => ("BIT", 3),
+
+            0x0A => ("ASL", 1),
+            0x06 | 0x16 => ("ASL", 2),
+            0x0E | 0x1E => ("ASL", 3),
+            0x4A => ("LSR", 1),
+            0x46 | 0x56 => ("LSR", 2),
+            0x4E | 0x5E => ("LSR", 3),
+            0x2A => ("ROL", 1),
+            0x26 | 0x36 => ("ROL", 2),
+            0x2E | 0x3E => ("ROL", 3),
+            0x6A => ("ROR", 1),
+            0x66 | 0x76 => ("ROR", 2),
+            0x6E | 0x7E => ("ROR", 3),
+
+            0x4C | 0x6C => ("JMP", 3),
+            0x20 => ("JSR", 3),
+            0x60 => ("RTS", 1),
+            0x40 => ("RTI", 1),
+
+            0xD0 => ("BNE", 2),
+            0xF0 => ("BEQ", 2),
+            0x90 => ("BCC", 2),
+            0xB0 => ("BCS", 2),
+            0x10 => ("BPL", 2),
+            0x30 => ("BMI", 2),
+            0x50 => ("BVC", 2),
+            0x70 => ("BVS", 2),
+
+            0x48 => ("PHA", 1),
+            0x68 => ("PLA", 1),
+            0x08 => ("PHP", 1),
+            0x28 => ("PLP", 1),
+
+            0x18 => ("CLC", 1),
+            0x38 => ("SEC", 1),
+            0x58 => ("CLI", 1),
+            0x78 => ("SEI", 1),
+            0xD8 => ("CLD", 1),
+            0xF8 => ("SED", 1),
+            0xB8 => ("CLV", 1),
+
+            0xEA => ("NOP", 1),
+            0x00 => ("BRK", 1),
+
+            _ => return None,
+        })
+    }
+
+    /// One line of diary: where the CPU is, the instruction it is about
+    /// to run, and the state of every pocket — before the deed.
+    pub fn trace(&self) -> Option<String> {
+        let opcode = self.read(self.pc);
+        let (name, length) = Cpu::opcode_name_and_length(opcode)?;
+
+        // The instruction's raw bytes, as many as it has.
+        let mut bytes = String::new();
+        for offset in 0..length {
+            let byte = self.read(self.pc.wrapping_add(offset));
+            bytes.push_str(&format!("{byte:02X} "));
+        }
+
+        Some(format!(
+            "{:04X}  {:<9} {}  A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}",
+            self.pc, bytes, name, self.a, self.x, self.y, self.status, self.sp
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1147,6 +1285,59 @@ mod tests {
     }
 
     #[test]
+    fn rti_pulls_status_and_the_exact_address() {
+        // Hand-build an interrupt's stack frame — PC $800A, then a
+        // status byte — and RTI must land exactly there, notes
+        // restored, no +1. The BRK at $800A catches the landing.
+        let cpu = run_program(&[
+            0xA9, 0x80, 0x48, // LDA #$80, PHA — address, big half
+            0xA9, 0x0A, 0x48, // LDA #$0A, PHA — address, little half
+            0xA9, 0x02, 0x48, // LDA #$02, PHA — a status with Z raised
+            0x40, // RTI
+            0x00, // $800A: BRK
+        ]);
+        assert_eq!(cpu.pc, 0x800B); // the BRK at $800A fetched, stopped
+        assert!(cpu.status & FLAG_ZERO != 0); // the pulled Z came back
+    }
+
+    #[test]
+    fn nestest_matches_the_golden_log() {
+        // Runs only when both files sit in roms/ — the robots skip
+        // politely on machines without them. (`let ... else`: destructure
+        // or bail.)
+        let (Ok(bytes), Ok(golden)) = (
+            std::fs::read("roms/nestest.nes"),
+            std::fs::read_to_string("roms/nestest.log"),
+        ) else {
+            return;
+        };
+
+        let mut cpu = Cpu::new(Cartridge::load(&bytes).unwrap());
+        cpu.reset();
+        cpu.pc = 0xC000;
+
+        let mut matched = 0;
+        for line in golden.lines() {
+            let ours = format!(
+                "{:04X} A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}",
+                cpu.pc, cpu.a, cpu.x, cpu.y, cpu.status, cpu.sp
+            );
+            let theirs = format!("{} {}", &line[0..4], &line[48..73]);
+            assert_eq!(ours, theirs, "diverged after {matched} matching lines");
+            matched += 1;
+
+            if Cpu::opcode_name_and_length(cpu.read(cpu.pc)).is_none() {
+                break; // the unofficial frontier — Part II territory
+            }
+            cpu.step();
+        }
+        assert!(
+            matched >= 5004,
+            "expected the whole official log, got {matched}"
+        );
+    }
+
+    #[test]
     fn ldx_speaks_zero_page_y() {
         // LDY #2, then LDX $0E,Y reads from $0010.
         let cpu = run_program_with(&[0xA0, 0x02, 0xB6, 0x0E, 0x00], &[(0x0010, 0x33)]);
@@ -1263,6 +1454,31 @@ mod tests {
         assert_eq!(cpu.a, 0);
     }
 
+    #[test]
+    fn indirect_y_pointer_at_ff_wraps_inside_the_zero_page() {
+        // The pointer's low half sits at $FF; its high half comes from
+        // $00 — never $0100. A decoy waits on the wrong path.
+        let cpu = run_program_with(
+            &[0xB1, 0xFF, 0x00],
+            &[
+                (0x00FF, 0x00), // pointer, little half
+                (0x0000, 0x03), // pointer, big half — the LAWFUL one
+                (0x0100, 0x07), // the wrong big half, lying in wait
+                (0x0300, 0x2A), // the prize, where the law leads
+            ],
+        );
+        assert_eq!(cpu.a, 0x2A);
+    }
+
+    #[test]
+    fn indirect_x_wraps_the_same_way() {
+        // X = 1 via TAX; base $FE + 1 = pointer $FF: same wrap.
+        let cpu = run_program_with(
+            &[0xA9, 0x01, 0xAA, 0xA1, 0xFE, 0x00],
+            &[(0x00FF, 0x00), (0x0000, 0x03), (0x0300, 0x55)],
+        );
+        assert_eq!(cpu.a, 0x55);
+    }
     #[test]
     fn jmp_indirect_obeys_the_page_edge_law() {
         // Pointer at $02FF: low byte from $02FF, high byte from $0200 —
