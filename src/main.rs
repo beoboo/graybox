@@ -2,9 +2,12 @@
 // This line tells Rust that the drawer `src/cpu.rs` exists and is part of
 // our program.
 mod cpu;
+// The drawer for everything that comes out of a .nes file.
+mod cartridge;
 
 use minifb::{Key, Scale, Window, WindowOptions};
 use cpu::Cpu;
+use cartridge::Cartridge;
 
 /// The NES picture is exactly 256 pixels wide...
 const WIDTH: usize = 256;
@@ -16,6 +19,12 @@ fn main() {
     // Give the CPU a moment in the terminal before the window steals
     // the show.
     cpu_demo();
+
+    // Handed a .nes file on the command line? Report its vital signs.
+    // (`if let` is a one-armed match: do this only if there IS a value.)
+    if let Some(path) = std::env::args().nth(1) {
+        rom_info(&path);
+    }
 
     // The frame buffer: one number for every pixel on our screen.
     // 0 means black, so right now this is a picture of nothing.
@@ -135,4 +144,22 @@ fn cpu_demo() {
             break;
         }
     }
+}
+
+/// Load a .nes file and report what's inside the plastic.
+fn rom_info(path: &str) {
+    let bytes = std::fs::read(path).expect("could not read the file");
+    let cartridge = Cartridge::load(&bytes).expect("could not parse the file");
+
+    println!();
+    println!("  {path}");
+    println!("  PRG ROM: {} KiB (the program)", cartridge.prg_rom.len() / 1024);
+    println!("  CHR ROM: {} KiB (the graphics)", cartridge.chr_rom.len() / 1024);
+    println!("  mapper:  {}", cartridge.mapper);
+
+    // The reset vector, straight off the cartridge: where this game's
+    // program begins.
+    let low = cartridge.read_prg(0xFFFC) as u16;
+    let high = cartridge.read_prg(0xFFFD) as u16;
+    println!("  starts at: ${:04X}", (high << 8) | low);
 }
