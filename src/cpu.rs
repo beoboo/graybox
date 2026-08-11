@@ -263,6 +263,40 @@ impl Cpu {
             0x50 => self.branch_if(self.status & FLAG_OVERFLOW == 0), // BVC
             0x70 => self.branch_if(self.status & FLAG_OVERFLOW != 0), // BVS
 
+            // PHA / PLA — PusH A onto the stack, PuLl it back.
+            0x48 => self.push(self.a),
+            0x68 => {
+                self.a = self.pull();
+                self.update_zero_and_negative(self.a);
+            }
+
+            // PHP / PLP — PusH and PuLl the Processor status itself,
+            // notes and all. Two ghost bits ride along: bits 4 and 5 exist
+            // only on pushed copies — PHP pushes them as ones, and PLP
+            // politely ignores them.
+            0x08 => self.push(self.status | 0b0011_0000),
+            0x28 => {
+                let value = self.pull();
+                self.status = (value | 0b0010_0000) & !0b0001_0000;
+            }
+
+            // JSR — Jump to SubRoutine: leave a return note on the
+            // stack, then go. The 6502's quirk: the note is the address
+            // of JSR's own LAST byte — one short of the next
+            // instruction. RTS knows, and adds the 1 back.
+            0x20 => {
+                let target = self.operand_address(AddressingMode::Absolute);
+                self.push_word(self.pc.wrapping_sub(1));
+                self.pc = target;
+            }
+
+            // RTS — ReTurn from Subroutine: read the note, add the
+            // missing 1, resume as if nothing happened.
+            0x60 => {
+                let return_address = self.pull_word();
+                self.pc = return_address.wrapping_add(1);
+            }
+
             // TAX — Transfer A to X. A keeps its value; X gets a copy.
             0xAA => {
                 self.x = self.a;
@@ -378,6 +412,35 @@ impl Cpu {
         if condition {
             self.pc = self.pc.wrapping_add(offset as u16);
         }
+    }
+
+    /// Push one byte onto the stack. The stack lives in page one,
+    /// $0100-$01FF; SP points at the NEXT free slot; and the pile grows
+    /// DOWNWARD - push writes, then steps down.
+    fn push(&mut self, value: u8) {
+        self.write(0x0100 + self.sp as u16, value);
+        self.sp = self.sp.wrapping_sub(1);
+    }
+
+    /// Pull one byte back off the stack: step up, then read.
+    /// (Most of the world says "pop"; the 6502 says "pull".)
+    fn pull(&mut self) -> u8 {
+        self.sp = self.sp.wrapping_add(1);
+        self.read(0x0100 + self.sp as u16)
+    }
+
+    /// Push a two-byte value: big half first, so that in memory it lies
+    /// little end first - the way the 6502 likes its addresses.
+    fn push_word(&mut self, value: u16) {
+        self.push((value >> 8) as u8);
+        self.push(value as u8);
+    }
+
+    /// Pull a two-byte value pushed by `push_word`.
+    fn pull_word(&mut self) -> u16 {
+        let low = self.pull() as u16;
+        let high = self.pull() as u16;
+        (high << 8) | low
     }
 
     /// Almost every instruction ends the same way: the CPU looks at the
@@ -670,5 +733,63 @@ mod tests {
         // A loop: INX / CPX #3 / BNE, round and round until X hits 3.
         let cpu = run_program(&[0xA9, 0x00, 0xAA, 0xE8, 0xE0, 0x03, 0xD0, 0xFB, 0x00]);
         assert_eq!(cpu.x, 3);
+    }
+
+    #[test]
+    fn pha_pla_round_trip() {
+        // LDA #7, PHA, LDA #0, PLA — the 7 survives the trip.
+        let cpu = run_program(&[0xA9, 0x07, 0x48, 0xA9, 0x00, 0x68, 0x00]);
+        assert_eq!(cpu.a, 7);
+    }
+
+    #[test]
+    fn the_stack_is_last_in_first_out() {
+        // Push 1, push 2 — then the pulls give 2 first, 1 second.
+        let cpu = run_program(&[0xA9, 0x01, 0x48, 0xA9, 0x02, 0x48, 0x68, 0xAA, 0x68, 0x00]);
+        assert_eq!(cpu.x, 2); // first pull (parked in X)
+        assert_eq!(cpu.a, 1); // second pull
+    }
+
+    #[test]
+    fn the_stack_lives_in_page_one() {
+        // One push: the byte lands at $0100 + SP's old value ($FD),
+        // and SP steps down to $FC.
+        let cpu = run_program(&[0xA9, 0x07, 0x48, 0x00]);
+        assert_eq!(cpu.read(0x01FD), 7);
+        assert_eq!(cpu.sp, 0xFC);
+    }
+
+    #[test]
+    fn jsr_notes_the_address_of_its_own_last_byte() {
+        // JSR $8004 jumps to a BRK. The pushed note reads $8002 —
+        // one short of the next instruction at $8003. RTS compensates.
+        let cpu = run_program(&[0x20, 0x04, 0x80, 0x00, 0x00]);
+        assert_eq!(cpu.read(0x01FD), 0x80); // big half
+        assert_eq!(cpu.read(0x01FC), 0x02); // little half
+    }
+
+    #[test]
+    fn jsr_and_rts_come_back_twice() {
+        // A helper that adds 10, called twice — each RTS finds its own
+        // way home.
+        let cpu = run_program(&[
+            0xA9, 0x05, 0x20, 0x09, 0x80, 0x20, 0x09, 0x80, 0x00, 0x18, 0x69, 0x0A, 0x60,
+        ]);
+        assert_eq!(cpu.a, 25);
+    }
+
+    #[test]
+    fn php_and_plp_carry_the_notes_across() {
+        // LDA #0 raises Zero; PHP saves the notes; LDA #1 clears it;
+        // PLP brings the saved notes back.
+        let cpu = run_program(&[0xA9, 0x00, 0x08, 0xA9, 0x01, 0x28, 0x00]);
+        assert!(cpu.status & FLAG_ZERO != 0);
+    }
+
+    #[test]
+    fn php_pushes_the_two_ghost_bits_as_ones() {
+        // The pushed copy of status always shows bits 4 and 5 set.
+        let cpu = run_program(&[0x08, 0x00]);
+        assert_eq!(cpu.read(0x01FD) & 0b0011_0000, 0b0011_0000);
     }
 }

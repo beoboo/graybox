@@ -94,17 +94,20 @@ fn draw_tile_grid(buffer: &mut [u32]) {
 /// Load a little machine-code program, wake the CPU, run it to the end,
 /// and print every pocket after every instruction.
 fn cpu_demo() {
-    // A program that goes BACKWARDS: count X up to three, by looping
-    // over the same instructions.
+    // One helper routine, called from TWO different places — and thanks
+    // to the stack, each call comes back to the right place.
     //
-    // bytes    meaning
-    // A9 00    LDA #0     start A at zero
-    // AA       TAX        X = 0 too
-    // E8       INX        add 1 to X          <-- $8003, the loop target
-    // E0 03    CPX #3     is X 3 yet?
-    // D0 FB    BNE -5     not yet? back to INX
-    // 00       BRK        done: stop
-    let program = [0xA9, 0x00, 0xAA, 0xE8, 0xE0, 0x03, 0xD0, 0xFB, 0x00];
+    // addr   bytes     meaning
+    // 8000   A9 05     LDA #5      start A at 5
+    // 8002   20 09 80  JSR $8009   call the helper...
+    // 8005   20 09 80  JSR $8009   ...call it AGAIN
+    // 8008   00        BRK         done
+    // 8009   18        CLC         the helper: add 10 to A...
+    // 800A   69 0A     ADC #10
+    // 800C   60        RTS         ...and go back to whoever called
+    let program = [
+        0xA9, 0x05, 0x20, 0x09, 0x80, 0x20, 0x09, 0x80, 0x00, 0x18, 0x69, 0x0A, 0x60,
+    ];
 
     let mut cpu = Cpu::new();
 
