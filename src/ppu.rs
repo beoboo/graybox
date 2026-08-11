@@ -39,6 +39,10 @@ pub struct Ppu {
     /// The eight palettes — 32 bytes the games fill at boot.
     pub palette_ram: [u8; 32],
 
+    /// The sprite roster — OAM, Object Attribute Memory: 64 sprites,
+    /// four bytes each. Games rebuild all 256 bytes every frame.
+    pub oam: [u8; 256],
+
     /// PPUCTRL, as last written: a byte of settings.
     pub ctrl: u8,
 
@@ -69,6 +73,7 @@ impl Ppu {
         Ppu {
             vram: [0; 2048],
             palette_ram: [0; 32],
+            oam: [0; 256],
             ctrl: 0,
             vblank: Cell::new(false),
             address: Cell::new(0),

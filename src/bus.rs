@@ -82,6 +82,18 @@ impl Bus {
             // The controller's strobe line.
             0x4016 => self.controller.write(value),
 
+            // Sprite memory's fast lane: one write here streams a
+            // whole 256-byte page of RAM into OAM. On hardware the
+            // CPU stands still for 513 cycles while it flows; ours
+            // is instant, and that debt is on the books for Part II.
+            0x4014 => {
+                let base = (value as u16) << 8;
+                for offset in 0..256u16 {
+                    let byte = self.read(base + offset);
+                    self.ppu.oam[offset as usize] = byte;
+                }
+            }
+
             // Writes to ROM change nothing. The clue is in the name.
             0x8000..=0xFFFF => {}
 

@@ -1528,4 +1528,30 @@ mod tests {
         while cpu.step() {}
         assert_eq!(cpu.a, 0);
     }
+
+    #[test]
+    fn a_write_to_4014_copies_a_whole_page_into_oam() {
+        let mut cpu = Cpu::new(test_cartridge(&[0x00]));
+        for i in 0..=255u8 {
+            cpu.write(0x0200 + i as u16, i);
+        }
+
+        cpu.write(0x4014, 0x02);
+
+        assert_eq!(cpu.bus.ppu.oam[0], 0);
+        assert_eq!(cpu.bus.ppu.oam[137], 137);
+        assert_eq!(cpu.bus.ppu.oam[255], 255);
+    }
+
+    #[test]
+    fn dma_reads_travel_through_the_bus() {
+        // Page $08 is an echo of page $00 — the RAM mirrors from
+        // chapter 11. A copy that grabbed at raw memory would miss it.
+        let mut cpu = Cpu::new(test_cartridge(&[0x00]));
+        cpu.write(0x0000, 0xAB);
+
+        cpu.write(0x4014, 0x08);
+
+        assert_eq!(cpu.bus.ppu.oam[0], 0xAB);
+    }
 }
