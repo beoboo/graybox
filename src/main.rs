@@ -4,6 +4,7 @@
 mod cpu;
 
 use minifb::{Key, Scale, Window, WindowOptions};
+use cpu::Cpu;
 
 /// The NES picture is exactly 256 pixels wide...
 const WIDTH: usize = 256;
@@ -12,6 +13,10 @@ const WIDTH: usize = 256;
 const HEIGHT: usize = 240;
 
 fn main() {
+    // Give the CPU a moment in the terminal before the window steals
+    // the show.
+    cpu_demo();
+
     // The frame buffer: one number for every pixel on our screen.
     // 0 means black, so right now this is a picture of nothing.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
@@ -82,6 +87,47 @@ fn draw_tile_grid(buffer: &mut [u32]) {
                 // one part into its neighbor.
                 buffer[y * WIDTH + x] = (color >> 1) & 0x007F_7F7F;
             }
+        }
+    }
+}
+
+/// Load a little machine-code program, wake the CPU, run it to the end,
+/// and print every pocket after every instruction.
+fn cpu_demo() {
+    // Our first program: six bytes.
+    //
+    // bytes    meaning
+    // A9 0A    LDA #10    put the number 10 into A
+    // AA       TAX        copy A into X
+    // E8       INX        add 1 to X
+    // E8       INX        add 1 to X
+    // 00       BRK        stop
+    let program = [0xA9, 0x0A, 0xAA, 0xE8, 0xE8, 0x00];
+
+    let mut cpu = Cpu::new();
+
+    // Copy the program into memory at $8000 — the neighborhood where
+    // cartridge programs traditionally live.
+    for (i, byte) in program.iter().enumerate() {
+        cpu.write(0x8000 + i as u16, *byte);
+    }
+
+    // Write $8000 into the reset vector, little end first,
+    // so the CPU wakes up inside our program.
+    cpu.write(0xFFFC, 0x00);
+    cpu.write(0xFFFD, 0x80);
+
+    cpu.reset();
+
+    // Run it, printing every pocket after every instruction.
+    println!("  pc     a  x  y");
+    println!("  ---------------");
+    loop {
+        let keep_going = cpu.step();
+        println!("  {:04X}   {:02X} {:02X} {:02X}", cpu.pc, cpu.a, cpu.x, cpu.y);
+        if !keep_going {
+            println!("  (BRK: the program is done)");
+            break;
         }
     }
 }

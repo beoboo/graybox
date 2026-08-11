@@ -26,6 +26,13 @@ pub struct Cpu {
     pub memory: [u8; 65536],
 }
 
+/// The Zero flag: switched on when the last value the CPU handled was zero.
+pub const FLAG_ZERO: u8 = 0b0000_0010;
+
+/// The Negative flag: a copy of the top bit — the sign bit — of the
+/// last value the CPU handled.
+pub const FLAG_NEGATIVE: u8 = 0b1000_0000;
+
 impl Cpu {
     /// A brand-new CPU: every pocket empty, every byte of memory zero.
     pub fn new() -> Cpu {
@@ -75,6 +82,66 @@ impl Cpu {
         // where its program begins. The CPU's first act is to read it.
         self.pc = self.read_word(0xFFFC);
     }
+
+    /// Run ONE instruction: fetch it, decode it, execute it.
+    /// Returns `false` when the program says stop, `true` otherwise.
+    pub fn step(&mut self) -> bool {
+        // FETCH: read the next instruction's number (its "opcode")
+        // and move the program counter past it.
+        let opcode = self.read(self.pc);
+        self.pc = self.pc.wrapping_add(1);
+
+        // DECODE and EXECUTE: recognize the opcode, do what it says.
+        match opcode {
+            // LDA #value — LoaD A with the byte right after the opcode.
+            0xA9 => {
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                self.a = value;
+                self.update_zero_and_negative(self.a);
+            }
+
+            // TAX — Transfer A to X. A keeps its value; X gets a copy.
+            0xAA => {
+                self.x = self.a;
+                self.update_zero_and_negative(self.x);
+            }
+
+            // INX — INcrement X: add 1. A pocket holds 0..=255, so
+            // "wrapping" means 255 + 1 = 0, the way a clock's minutes
+            // roll from 59 back to 00.
+            0xE8 => {
+                self.x = self.x.wrapping_add(1);
+                self.update_zero_and_negative(self.x);
+            }
+
+            // BRK — simplified into a stop sign until interrupts arrive
+            // (chapter 18). The real thing is more interesting.
+            0x00 => return false,
+
+            // An opcode we don't implement. Stopping loudly beats
+            // carrying on wrongly.
+            _ => panic!("I don't know opcode {opcode:#04X} yet!"),
+        }
+
+        true
+    }
+
+    /// Almost every instruction ends the same way: the CPU looks at the
+    /// value it just produced and updates two flags about it.
+    fn update_zero_and_negative(&mut self, value: u8) {
+        if value == 0 {
+            self.status |= FLAG_ZERO; // switch the bit on
+        } else {
+            self.status &= !FLAG_ZERO; // switch the bit off
+        }
+
+        if value & FLAG_NEGATIVE != 0 {
+            self.status |= FLAG_NEGATIVE;
+        } else {
+            self.status &= !FLAG_NEGATIVE;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +177,58 @@ mod tests {
         assert_eq!(cpu.y, 0);
         assert_eq!(cpu.sp, 0xFD);
         assert_eq!(cpu.status, 0b0010_0100);
+    }
+
+    /// Put a little program at $8000, point the reset vector at it,
+    /// run it until BRK, and hand the CPU back for inspection.
+    fn run_program(program: &[u8]) -> Cpu {
+        let mut cpu = Cpu::new();
+        for (i, byte) in program.iter().enumerate() {
+            cpu.write(0x8000 + i as u16, *byte);
+        }
+        cpu.write(0xFFFC, 0x00);
+        cpu.write(0xFFFD, 0x80);
+        cpu.reset();
+
+        while cpu.step() {}
+        cpu
+    }
+
+    #[test]
+    fn lda_loads_a_number_into_a() {
+        let cpu = run_program(&[0xA9, 0x07, 0x00]);
+        assert_eq!(cpu.a, 0x07);
+    }
+
+    #[test]
+    fn lda_zero_switches_the_zero_flag_on() {
+        let cpu = run_program(&[0xA9, 0x00, 0x00]);
+        assert!(cpu.status & FLAG_ZERO != 0);
+    }
+
+    #[test]
+    fn lda_top_bit_switches_the_negative_flag_on() {
+        let cpu = run_program(&[0xA9, 0x80, 0x00]);
+        assert!(cpu.status & FLAG_NEGATIVE != 0);
+    }
+
+    #[test]
+    fn tax_copies_a_into_x() {
+        let cpu = run_program(&[0xA9, 0x0A, 0xAA, 0x00]);
+        assert_eq!(cpu.x, 0x0A);
+        assert_eq!(cpu.a, 0x0A); // A keeps its copy
+    }
+
+    #[test]
+    fn inx_adds_one_to_x() {
+        let cpu = run_program(&[0xA9, 0x0A, 0xAA, 0xE8, 0x00]);
+        assert_eq!(cpu.x, 0x0B);
+    }
+
+    #[test]
+    fn inx_wraps_255_around_to_zero() {
+        let cpu = run_program(&[0xA9, 0xFF, 0xAA, 0xE8, 0x00]);
+        assert_eq!(cpu.x, 0);
+        assert!(cpu.status & FLAG_ZERO != 0);
     }
 }
