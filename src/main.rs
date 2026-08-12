@@ -113,7 +113,9 @@ fn main() {
                 }
             }
 
-            render_background(cpu, &mut buffer);
+            // The picture was painted during the frame, one dot at a
+            // time; the window just collects it.
+            buffer.copy_from_slice(&cpu.bus.ppu.frame);
             render_sprites(cpu, &mut buffer);
 
             // A frame of picture gets its sixtieth of a second
@@ -197,51 +199,6 @@ fn boot_rom(path: &str) -> Cpu {
     println!("  ...and on it goes.");
     // Hand the machine back to whoever booted it.
     cpu
-}
-
-/// Paint the background the game described: the nametable says which
-/// tile goes in each of the 30 rows of 32 cells; PPUCTRL says which
-/// pattern table backgrounds shop from.
-fn render_background(cpu: &Cpu, buffer: &mut [u32]) {
-    let ppu = &cpu.bus.ppu;
-    let chr = &cpu.bus.cartridge.chr_rom;
-
-    // PPUCTRL bit 4: which half of the album holds background tiles.
-    let table = if ppu.ctrl & 0b0001_0000 != 0 { 256 } else { 0 };
-
-    for row in 0..30 {
-        for col in 0..32 {
-            let tile = ppu.vram[row * 32 + col] as usize;
-            let pixels = ppu::decode_tile(chr, table + tile);
-            let palette = background_palette(ppu, row, col);
-
-            for y in 0..8 {
-                for x in 0..8 {
-                    let crayon = palette[pixels[y][x] as usize];
-                    let color = ppu::SYSTEM_PALETTE[crayon as usize];
-                    buffer[(row * 8 + y) * WIDTH + col * 8 + x] = color;
-                }
-            }
-        }
-    }
-}
-
-/// Which four crayons a background tile paints with: the attribute
-/// table's two bits pick one of the four background palettes, and
-/// crayon 0 is always the shared backdrop color.
-fn background_palette(ppu: &ppu::Ppu, row: usize, col: usize) -> [u8; 4] {
-    // One attribute byte governs a 4x4-tile block; within it, two bits
-    // per 2x2-tile quadrant.
-    let attribute = ppu.vram[0x3C0 + (row / 4) * 8 + col / 4];
-    let shift = ((row % 4) / 2) * 4 + ((col % 4) / 2) * 2;
-    let which = ((attribute >> shift) & 0b11) as usize;
-
-    [
-        ppu.palette_ram[0], // the backdrop, everyone's crayon 0
-        ppu.palette_ram[which * 4 + 1],
-        ppu.palette_ram[which * 4 + 2],
-        ppu.palette_ram[which * 4 + 3],
-    ]
 }
 
 /// Paint the 64 sprites over the finished background, roster's back

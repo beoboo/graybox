@@ -50,6 +50,25 @@ pub struct Ppu {
     /// switches — the register that says whether rendering is on.
     pub mask: u8,
 
+    /// The picture, one color per pixel, painted a dot at a time as
+    /// the beam walks. `main` collects it when the frame completes.
+    pub frame: Vec<u32>,
+
+    /// The conveyor: pattern bits for the tile being drawn and the
+    /// tile behind it. The front pixel leaves from bit 15.
+    shift_low: u16,
+    shift_high: u16,
+
+    /// The same conveyor for the palette choice, two bits per pixel.
+    attr_low: u16,
+    attr_high: u16,
+
+    /// The pockets the fetch fills: one tile's pattern planes and
+    /// its palette pick, waiting for the next tile boundary.
+    next_pattern_low: u8,
+    next_pattern_high: u8,
+    next_attr: u8,
+
     /// Whether the PPU is in its vertical-blank rest period.
     pub vblank: Cell<bool>,
 
@@ -80,6 +99,14 @@ impl Ppu {
             oam: [0; 256],
             ctrl: 0,
             mask: 0,
+            frame: vec![0; 256 * 240],
+            shift_low: 0,
+            shift_high: 0,
+            attr_low: 0,
+            attr_high: 0,
+            next_pattern_low: 0,
+            next_pattern_high: 0,
+            next_attr: 0,
             vblank: Cell::new(false),
             address: Cell::new(0),
             read_buffer: Cell::new(0),
@@ -127,8 +154,8 @@ impl Ppu {
             // mirroring arrangement.
             0x2000..=0x3EFF => self.vram[self.mirror(address)] = value,
 
-            // The palettes' 32 bytes.
-            _ => self.palette_ram[address as usize & 0x001F] = value,
+            // The palettes' 32 bytes, through the fold.
+            _ => self.palette_ram[Self::palette_index(address)] = value,
         }
 
         self.step_address();
@@ -166,7 +193,7 @@ impl Ppu {
             // this side of the chip yet.
             0x0000..=0x1FFF => 0,
             0x2000..=0x3EFF => self.vram[self.mirror(address)],
-            _ => self.palette_ram[address as usize & 0x001F],
+            _ => self.palette_ram[Self::palette_index(address)],
         });
 
         self.step_address();
@@ -179,6 +206,138 @@ impl Ppu {
     pub fn rendering(&self) -> bool {
         self.mask & 0b0001_1000 != 0
     }
+
+    /// Fill the pockets for one tile of one scanline: which tile
+    /// (the nametable), its palette pick (the attribute table), and
+    /// its two planes of pattern bits — chapter 13's read, done by
+    /// the chip itself this time.
+    fn fetch_tile(&mut self, scanline: usize, col: usize, chr: &[u8]) {
+        let (row, fine_y) = (scanline / 8, scanline % 8);
+        let tile = self.vram[row * 32 + col] as usize;
+
+        let attribute = self.vram[0x3C0 + (row / 4) * 8 + col / 4];
+        let shift = ((row % 4) / 2) * 4 + ((col % 4) / 2) * 2;
+        self.next_attr = (attribute >> shift) & 0b11;
+
+        // PPUCTRL bit 4 picks the background's half of the album:
+        // sixteen bytes a tile, the high plane eight bytes in.
+        let table = if self.ctrl & 0b0001_0000 != 0 {
+            0x1000
+        } else {
+            0
+        };
+        let start = table + tile * 16 + fine_y;
+        self.next_pattern_low = chr[start];
+        self.next_pattern_high = chr[start + 8];
+    }
+
+    /// The belt advances one pixel: every register slides one bit
+    /// toward the front.
+    fn shift(&mut self) {
+        self.shift_low <<= 1;
+        self.shift_high <<= 1;
+        self.attr_low <<= 1;
+        self.attr_high <<= 1;
+    }
+
+    /// A tile boundary: the pockets empty onto the back of the belt.
+    /// The two attribute bits stretch to cover all eight pixels.
+    fn reload_shifts(&mut self) {
+        self.shift_low = (self.shift_low & 0xFF00) | self.next_pattern_low as u16;
+        self.shift_high = (self.shift_high & 0xFF00) | self.next_pattern_high as u16;
+
+        let low = if self.next_attr & 1 != 0 { 0xFF } else { 0 };
+        let high = if self.next_attr & 2 != 0 { 0xFF } else { 0 };
+        self.attr_low = (self.attr_low & 0xFF00) | low;
+        self.attr_high = (self.attr_high & 0xFF00) | high;
+    }
+
+    /// One pixel, from whatever is at the front of the belt right
+    /// now — which is the whole point: the belt's front IS the beam.
+    fn draw_dot(&mut self, scanline: usize, x: usize) {
+        let color = if self.mask & 0b0000_1000 != 0 {
+            let low = (self.shift_low >> 15) & 1;
+            let high = (self.shift_high >> 15) & 1;
+            let value = ((high << 1) | low) as usize;
+
+            let palette =
+                (((self.attr_high >> 15) & 1) << 1 | ((self.attr_low >> 15) & 1)) as usize;
+
+            // Pattern value 0 is the shared backdrop, whichever
+            // palette the neighborhood picked.
+            let crayon = if value == 0 {
+                self.palette_ram[0]
+            } else {
+                self.palette_ram[palette * 4 + value]
+            };
+            SYSTEM_PALETTE[crayon as usize]
+        } else {
+            // With rendering off and the address register parked
+            // inside the crayon box, the screen shows THAT crayon —
+            // the door `full_palette` draws its rainbow through.
+            let address = self.address.get() & 0x3FFF;
+            if address >= 0x3F00 {
+                let crayon = self.palette_ram[Self::palette_index(address)];
+                self.frame[scanline * 256 + x] = SYSTEM_PALETTE[crayon as usize];
+                return;
+            }
+
+            // The background is hidden: the dot is backdrop.
+            SYSTEM_PALETTE[self.palette_ram[0] as usize]
+        };
+
+        self.frame[scanline * 256 + x] = color;
+    }
+
+    /// One dot of the picture chip's day. Visible dots leave through
+    /// the belt; the belt advances and the pockets refill on the
+    /// schedule the beam sets; the tail of every line — warm-up lap
+    /// included — primes the first two tiles of the line below.
+    pub fn tick(&mut self, scanline: u16, dot: u16, chr: &[u8]) {
+        let (scanline, dot) = (scanline as usize, dot as usize);
+        let drawing_line = scanline < 240;
+
+        if drawing_line && (1..=256).contains(&dot) {
+            self.draw_dot(scanline, dot - 1);
+        }
+
+        if !self.rendering() || (!drawing_line && scanline != 261) {
+            return;
+        }
+
+        if drawing_line && (1..=256).contains(&dot) {
+            self.shift();
+
+            // Boundaries land after every eighth pixel; the tile
+            // fetched here reaches the front sixteen dots later.
+            if dot % 8 == 0 && dot <= 240 {
+                self.fetch_tile(scanline, dot / 8 + 1, chr);
+                self.reload_shifts();
+            }
+        }
+
+        if (321..=336).contains(&dot) {
+            self.shift();
+
+            if dot == 328 || dot == 336 {
+                let below = if scanline == 261 { 0 } else { scanline + 1 };
+                self.fetch_tile(below, if dot == 328 { 0 } else { 1 }, chr);
+                self.reload_shifts();
+            }
+        }
+    }
+
+    /// The crayon box folds: $3F10, $3F14, $3F18 and $3F1C are the
+    /// same cells as $3F00, $3F04, $3F08 and $3F0C — one shared
+    /// backdrop column for backgrounds and sprites alike.
+    fn palette_index(address: u16) -> usize {
+        let index = (address & 0x001F) as usize;
+        if index >= 0x10 && index % 4 == 0 {
+            index - 0x10
+        } else {
+            index
+        }
+    }
 }
 
 /// The NES's whole crayon box: the 64 colors it can ever show, as RGB.
@@ -188,14 +347,14 @@ impl Ppu {
 /// These values were computed from the signal's documented voltages
 /// (Part II does that computation live, and finds even more colors).
 pub const SYSTEM_PALETTE: [u32; 64] = [
-    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
-    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
-    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
-    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
-    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
-    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
-    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
-    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
+    0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
+    0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
+    0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
+    0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
+    0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
+    0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
+    0x000000,
 ];
 
 #[cfg(test)]
@@ -364,4 +523,73 @@ mod tests {
         ppu.write_data(0x77);
         assert_eq!(ppu.vram[8], 0x77);
     }
+
+    /// A cartridge's worth of art for the belt tests: tile 0 blank,
+    /// tile 1 solid pattern-value 3.
+    fn test_chr() -> Vec<u8> {
+        let mut chr = vec![0; 8192];
+        for byte in &mut chr[16..32] {
+            *byte = 0xFF;
+        }
+        chr
+    }
+
+    /// Walk the belt through the warm-up lap's priming and into a
+    /// scanline, so the frame's first pixels arrive the way real ones do.
+    fn prime_and_draw(ppu: &mut Ppu, chr: &[u8], dots: usize) {
+        for dot in 321..=336 {
+            ppu.tick(261, dot, chr);
+        }
+        for dot in 1..=dots as u16 {
+            ppu.tick(0, dot, chr);
+        }
+    }
+
+    #[test]
+    fn the_crayon_box_folds_at_3f10() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x3F);
+        ppu.write_address(0x10);
+        ppu.write_data(0x2A);
+        assert_eq!(ppu.palette_ram[0], 0x2A); // landed on $3F00
+    }
+
+    #[test]
+    fn the_belt_delivers_the_tile_under_the_beam() {
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0000_1000; // background on
+        ppu.vram[0] = 1; // first cell: the solid tile
+        ppu.vram[2] = 1; // third cell: solid again
+        ppu.palette_ram[0] = 0x0F; // backdrop: black
+        ppu.palette_ram[3] = 0x30; // palette 0, value 3: white
+
+        prime_and_draw(&mut ppu, &test_chr(), 16);
+
+        // Tile 0 of the line is solid value 3; its neighbor is blank
+        // and falls through to the backdrop.
+        assert_eq!(ppu.frame[0], SYSTEM_PALETTE[0x30]);
+        assert_eq!(ppu.frame[7], SYSTEM_PALETTE[0x30]);
+        assert_eq!(ppu.frame[8], SYSTEM_PALETTE[0x0F]);
+
+        // The palette answers at pixel time: repaint the crayon
+        // mid-line, and the third cell — same tile, same bits,
+        // already fetched — comes out in the new color.
+        ppu.palette_ram[3] = 0x16;
+        for dot in 17..=24 {
+            ppu.tick(0, dot, &test_chr());
+        }
+        assert_eq!(ppu.frame[16], SYSTEM_PALETTE[0x16]);
+    }
+
+    #[test]
+    fn rendering_off_shows_the_crayon_the_address_points_at() {
+        let mut ppu = Ppu::new(false);
+        ppu.palette_ram[7] = 0x21;
+        ppu.write_address(0x3F);
+        ppu.write_address(0x07);
+
+        ppu.tick(0, 5, &test_chr());
+        assert_eq!(ppu.frame[4], SYSTEM_PALETTE[0x21]);
+    }
+
 }

@@ -632,6 +632,14 @@ impl Cpu {
                 self.bus.clock.tick();
             }
 
+            // The picture chip lives on this clock: every dot is
+            // its turn — fetching, shifting, painting.
+            self.bus.ppu.tick(
+                self.bus.clock.scanline,
+                self.bus.clock.dot,
+                &self.bus.cartridge.chr_rom,
+            );
+
             if self.bus.clock.scanline == 241 && self.bus.clock.dot == 1 {
                 self.bus.ppu.vblank.set(true);
                 if self.bus.ppu.ctrl & 0b1000_0000 != 0 {
@@ -1133,7 +1141,9 @@ mod tests {
 
         Cartridge {
             prg_rom: prg,
-            chr_rom: Vec::new(),
+            // The picture chip fetches art every rendered dot now,
+            // so even a throwaway cartridge carries a blank album.
+            chr_rom: vec![0; 8 * 1024],
             mapper: 0,
             vertical_mirroring: false,
         }
@@ -1821,7 +1831,11 @@ mod tests {
         cpu.bus.write(0x2001, 0b0000_1000);
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (2, 0, 0)
         );
 
@@ -1830,7 +1844,11 @@ mod tests {
         let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (1, 261, 340)
         );
     }
