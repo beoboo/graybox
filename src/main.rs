@@ -12,6 +12,8 @@ mod ppu;
 mod controller;
 // The sound chip.
 mod apu;
+// The metronome the whole machine marches to.
+mod clock;
 
 use minifb::{Key, Scale, Window, WindowOptions};
 // The speaker's plumbing: a queue of samples, shared with the audio
@@ -19,9 +21,9 @@ use minifb::{Key, Scale, Window, WindowOptions};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
-use cartridge::Cartridge;
 
 /// The NES picture is exactly 256 pixels wide...
 const WIDTH: usize = 256;
@@ -107,26 +109,16 @@ fn main() {
 
             cpu.bus.controller.buttons = buttons;
 
-            // The visible part: the beam paints, the game computes.
-            let visible_until = cpu.cycles + VISIBLE_CYCLES;
-            while cpu.cycles < visible_until {
-                cpu.step();
+            // One trip around this loop is one frame, measured by the
+            // machine's own metronome. The vblank flag and the NMI are
+            // the clock's business, handled on their exact dots inside
+            // `step` — this loop only asks when the frame is over.
+            let frame = cpu.bus.clock.frame;
+            while cpu.bus.clock.frame == frame {
+                if !cpu.step() {
+                    break; // a jammed machine keeps its last picture
+                }
             }
-
-            // The beam rests; vblank begins, and a game that armed
-            // PPUCTRL bit 7 gets it hand-delivered by the NMI.
-            cpu.bus.ppu.vblank.set(true);
-            if cpu.bus.ppu.ctrl & 0b1000_0000 != 0 {
-                cpu.nmi();
-            }
-            let vblank_until = cpu.cycles + VBLANK_CYCLES;
-            while cpu.cycles < vblank_until {
-                cpu.step();
-            }
-
-            // The rest is over — the flag drops whether or not anyone
-            // ever came to read it.
-            cpu.bus.ppu.vblank.set(false);
 
             render_background(cpu, &mut buffer);
             render_sprites(cpu, &mut buffer);
@@ -270,8 +262,7 @@ fn render_sprites(cpu: &Cpu, buffer: &mut [u32]) {
     let table = if ppu.ctrl & 0b0000_1000 != 0 { 256 } else { 0 };
 
     for sprite in ppu.oam.chunks(4).rev() {
-        let (top, tile, attributes, left) =
-            (sprite[0], sprite[1], sprite[2], sprite[3]);
+        let (top, tile, attributes, left) = (sprite[0], sprite[1], sprite[2], sprite[3]);
 
         // Parking a sprite at the bottom edge is the "I'm not here"
         // convention: anything from $EF down starts past row 239.
@@ -378,7 +369,11 @@ fn start_audio() -> Option<Speaker> {
         .ok()?;
 
     stream.play().ok()?;
-    Some(Speaker { _stream: stream, queue, sample_rate })
+    Some(Speaker {
+        _stream: stream,
+        queue,
+        sample_rate,
+    })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden

@@ -34,6 +34,11 @@ pub struct Cpu {
     /// stepped into the next page — the readers' one-cycle surcharge.
     crossed: bool,
 
+    /// Raised when the clock crosses into vblank with the NMI armed.
+    /// The interrupt itself fires between instructions — the hardware
+    /// finishes what it started before answering the tap.
+    nmi_pending: bool,
+
     /// The bus: everything the CPU can reach lives on its far side.
     pub bus: Bus,
 }
@@ -132,6 +137,7 @@ impl Cpu {
             status: 0,
             cycles: 0,
             crossed: false,
+            nmi_pending: false,
             bus: Bus::new(cartridge),
         }
     }
@@ -261,6 +267,10 @@ impl Cpu {
     /// Run ONE instruction: fetch it, decode it, execute it.
     /// Returns `false` when the program says stop, `true` otherwise.
     pub fn step(&mut self) -> bool {
+        // Note the odometer: whatever this instruction ends up
+        // costing, the clock must tick three dots for every cycle.
+        let before = self.cycles;
+
         // FETCH: read the next instruction's number (its "opcode")
         // and move the program counter past it.
         let opcode = self.read(self.pc);
@@ -589,7 +599,50 @@ impl Cpu {
             self.cycles += 1;
         }
 
+        // Time passes: three dots for every cycle spent. If the
+        // ticks crossed into vblank with the NMI armed, the tap
+        // lands here, before the next instruction fetches.
+        self.advance_clock(self.cycles - before);
+        if self.nmi_pending {
+            self.nmi_pending = false;
+            self.nmi();
+            self.advance_clock(7);
+        }
+
         true
+    }
+
+    /// March the metronome: three dots per CPU cycle. The clock's
+    /// crossings move the vblank flag and request the NMI on their
+    /// exact dots, no matter which instruction was running.
+    fn advance_clock(&mut self, cycles: u64) {
+        for _ in 0..cycles * 3 {
+            self.bus.clock.tick();
+
+            // The odd-frame skip: with rendering on, every other
+            // frame's warm-up lap is one dot short. The clock passes
+            // through the skipped dot without spending time on it,
+            // and the books balance to the half cycle every two
+            // frames.
+            if self.bus.clock.scanline == 261
+                && self.bus.clock.dot == 340
+                && self.bus.clock.frame % 2 == 1
+                && self.bus.ppu.rendering()
+            {
+                self.bus.clock.tick();
+            }
+
+            if self.bus.clock.scanline == 241 && self.bus.clock.dot == 1 {
+                self.bus.ppu.vblank.set(true);
+                if self.bus.ppu.ctrl & 0b1000_0000 != 0 {
+                    self.nmi_pending = true;
+                }
+            }
+
+            if self.bus.clock.scanline == 261 && self.bus.clock.dot == 1 {
+                self.bus.ppu.vblank.set(false);
+            }
+        }
     }
 
     /// LDA, any flavor: find the value, load it into A, take notes.
@@ -1740,5 +1793,45 @@ mod tests {
         assert_eq!(cpu.read(0x01FC), 0x02); // $8002 — PAST the pad byte
         assert!(cpu.read(0x01FB) & 0b0001_0000 != 0); // B flag raised
         assert!(cpu.status & FLAG_INTERRUPT_DISABLE != 0);
+    }
+
+    #[test]
+    fn the_vblank_flag_moves_on_its_exact_dots() {
+        // Scanline 241, dot 1 sits 82,182 dots in — 27,394 cycles
+        // exactly. One cycle earlier the flag must still be down.
+        let mut cpu = Cpu::new(test_cartridge(&[]));
+        cpu.advance_clock(27_393);
+        assert!(!cpu.bus.ppu.vblank.get());
+
+        cpu.advance_clock(1);
+        assert!(cpu.bus.ppu.vblank.get());
+
+        // Scanline 261, dot 1 sits 89,002 dots in; the cycle that
+        // carries the clock past it takes the flag down again.
+        cpu.advance_clock(29_668 - 27_394);
+        assert!(!cpu.bus.ppu.vblank.get());
+    }
+
+    #[test]
+    fn two_rendered_frames_land_the_clock_back_on_the_corner() {
+        // 89,342 + 89,341 dots is exactly 59,561 cycles: with
+        // rendering on, the odd frame's skip makes two frames of
+        // time close the books to the dot.
+        let mut cpu = Cpu::new(test_cartridge(&[]));
+        cpu.bus.write(0x2001, 0b0000_1000);
+        cpu.advance_clock(59_561);
+        assert_eq!(
+            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (2, 0, 0)
+        );
+
+        // With rendering off nothing is skipped, and the same time
+        // stops one dot before the second frame ends.
+        let mut cpu = Cpu::new(test_cartridge(&[]));
+        cpu.advance_clock(59_561);
+        assert_eq!(
+            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (1, 261, 340)
+        );
     }
 }

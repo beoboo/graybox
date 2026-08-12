@@ -2,6 +2,7 @@
 
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
+use crate::clock::Clock;
 use crate::controller::Controller;
 use crate::ppu::Ppu;
 
@@ -21,6 +22,9 @@ pub struct Bus {
 
     /// The sound chip.
     pub apu: Apu,
+
+    /// The metronome: where the beam is, dot by dot.
+    pub clock: Clock,
 }
 
 impl Bus {
@@ -32,6 +36,7 @@ impl Bus {
             ppu: Ppu::new(cartridge.vertical_mirroring),
             controller: Controller::new(),
             apu: Apu::new(),
+            clock: Clock::new(),
             cartridge,
         }
     }
@@ -79,8 +84,9 @@ impl Bus {
                 0x0000 => self.ppu.ctrl = value,
                 0x0006 => self.ppu.write_address(value),
                 0x0007 => self.ppu.write_data(value),
-                // Mask, scroll, sprite registers: wired in the
-                // chapters that need them.
+                // The mask lands; scroll and the sprite pair still
+                // wait for their chapters.
+                0x0001 => self.ppu.mask = value,
                 _ => {}
             },
 
