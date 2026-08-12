@@ -21,9 +21,9 @@ use minifb::{Key, Scale, Window, WindowOptions};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
+use cartridge::Cartridge;
 
 /// The NES picture is exactly 256 pixels wide...
 const WIDTH: usize = 256;
@@ -78,13 +78,6 @@ fn main() {
     // Show the buffer, over and over, until the window is closed
     // or Esc is pressed.
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // One trip around this loop is one frame, measured the way the
-        // console measures it: in cycles. The beam paints for 241
-        // scanlines, rests for 21 — and at 341 dots a line, 3 dots a
-        // cycle, that is the whole arithmetic of a television frame.
-        const VISIBLE_CYCLES: u64 = 241 * 341 / 3; // 27,393
-        const VBLANK_CYCLES: u64 = 21 * 341 / 3; // 2,387
-
         if let Some(cpu) = &mut machine {
             // The keyboard becomes the controller — one key per
             // button, in the console's own order: A, B, Select,
@@ -262,7 +255,8 @@ fn render_sprites(cpu: &Cpu, buffer: &mut [u32]) {
     let table = if ppu.ctrl & 0b0000_1000 != 0 { 256 } else { 0 };
 
     for sprite in ppu.oam.chunks(4).rev() {
-        let (top, tile, attributes, left) = (sprite[0], sprite[1], sprite[2], sprite[3]);
+        let (top, tile, attributes, left) =
+            (sprite[0], sprite[1], sprite[2], sprite[3]);
 
         // Parking a sprite at the bottom edge is the "I'm not here"
         // convention: anything from $EF down starts past row 239.
@@ -369,11 +363,7 @@ fn start_audio() -> Option<Speaker> {
         .ok()?;
 
     stream.play().ok()?;
-    Some(Speaker {
-        _stream: stream,
-        queue,
-        sample_rate,
-    })
+    Some(Speaker { _stream: stream, queue, sample_rate })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden
