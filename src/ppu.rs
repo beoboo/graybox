@@ -212,20 +212,27 @@ impl Ppu {
     /// its two planes of pattern bits — chapter 13's read, done by
     /// the chip itself this time.
     fn fetch_tile(&mut self, scanline: usize, col: usize, chr: &[u8]) {
+        // Eight pixel rows to a tile row: scanline 13 is tile row 1,
+        // five pixel rows into it.
         let (row, fine_y) = (scanline / 8, scanline % 8);
+
+        // The nametable: a 32-wide grid of tile numbers.
         let tile = self.vram[row * 32 + col] as usize;
 
+        // The attribute table sits after the 960 tile cells, one
+        // byte per 4x4-tile block — so divide both coordinates by
+        // four to find the block's byte.
         let attribute = self.vram[0x3C0 + (row / 4) * 8 + col / 4];
+
+        // Inside the byte, two bits per 2x2-tile quadrant: the
+        // bottom half of the block reads the high nibble (+4), the
+        // right half reads each nibble's high pair (+2).
         let shift = ((row % 4) / 2) * 4 + ((col % 4) / 2) * 2;
         self.next_attr = (attribute >> shift) & 0b11;
 
         // PPUCTRL bit 4 picks the background's half of the album:
         // sixteen bytes a tile, the high plane eight bytes in.
-        let table = if self.ctrl & 0b0001_0000 != 0 {
-            0x1000
-        } else {
-            0
-        };
+        let table = if self.ctrl & 0b0001_0000 != 0 { 0x1000 } else { 0 };
         let start = table + tile * 16 + fine_y;
         self.next_pattern_low = chr[start];
         self.next_pattern_high = chr[start + 8];
@@ -347,14 +354,14 @@ impl Ppu {
 /// These values were computed from the signal's documented voltages
 /// (Part II does that computation live, and finds even more colors).
 pub const SYSTEM_PALETTE: [u32; 64] = [
-    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
-    0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
-    0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
-    0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
-    0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
-    0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
-    0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
-    0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
+    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
+    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
+    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
+    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
+    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
+    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
+    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
 ];
 
 #[cfg(test)]
@@ -591,5 +598,4 @@ mod tests {
         ppu.tick(0, 5, &test_chr());
         assert_eq!(ppu.frame[4], SYSTEM_PALETTE[0x21]);
     }
-
 }

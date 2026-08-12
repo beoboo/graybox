@@ -1831,11 +1831,7 @@ mod tests {
         cpu.bus.write(0x2001, 0b0000_1000);
         cpu.advance_clock(59_561);
         assert_eq!(
-            (
-                cpu.bus.clock.frame,
-                cpu.bus.clock.scanline,
-                cpu.bus.clock.dot
-            ),
+            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
             (2, 0, 0)
         );
 
@@ -1844,11 +1840,7 @@ mod tests {
         let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.advance_clock(59_561);
         assert_eq!(
-            (
-                cpu.bus.clock.frame,
-                cpu.bus.clock.scanline,
-                cpu.bus.clock.dot
-            ),
+            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
             (1, 261, 340)
         );
     }
