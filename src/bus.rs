@@ -81,12 +81,13 @@ impl Bus {
             // The picture chip's registers, for the writes games lean
             // on: settings, the address, the data.
             0x2000..=0x3FFF => match address & 0x0007 {
-                0x0000 => self.ppu.ctrl = value,
+                0x0000 => self.ppu.write_ctrl(value),
                 0x0006 => self.ppu.write_address(value),
                 0x0007 => self.ppu.write_data(value),
                 // The mask lands; scroll and the sprite pair still
                 // wait for their chapters.
                 0x0001 => self.ppu.mask = value,
+                0x0005 => self.ppu.write_scroll(value),
                 _ => {}
             },
 

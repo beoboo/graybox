@@ -72,17 +72,26 @@ pub struct Ppu {
     /// Whether the PPU is in its vertical-blank rest period.
     pub vblank: Cell<bool>,
 
-    /// Where in PPU memory the next data access will land. A `Cell`,
-    /// because READS move it too.
-    address: Cell<u16>,
+    /// `v` — the address the chip is USING: where the beam reads
+    /// tiles while drawing, and where the data port lands between
+    /// frames. A `Cell`, because READS move it too.
+    v: Cell<u16>,
+
+    /// `t` — the address being STAGED: what the game writes through
+    /// $2000, $2005 and $2006, waiting to be copied into `v`.
+    t: u16,
+
+    /// `x` — fine X: which of a tile's eight pixels the left screen
+    /// edge cuts through.
+    x: u8,
 
     /// The one-byte waiting room for PPUDATA reads: what a read hands
     /// back is the byte fetched by the PREVIOUS read.
     read_buffer: Cell<u8>,
 
-    /// The address arrives through an 8-bit register in two knocks;
-    /// this remembers whether the SECOND knock is next.
-    expecting_low: Cell<bool>,
+    /// `w` — the shared two-knock latch: $2005 and $2006 both knock
+    /// twice, on the SAME latch, and reading $2002 resets it.
+    w: Cell<bool>,
 
     /// How this cartridge's board arranges the four nametable names
     /// over the two real rooms of VRAM.
@@ -108,9 +117,11 @@ impl Ppu {
             next_pattern_high: 0,
             next_attr: 0,
             vblank: Cell::new(false),
-            address: Cell::new(0),
+            v: Cell::new(0),
+            t: 0,
+            x: 0,
             read_buffer: Cell::new(0),
-            expecting_low: Cell::new(false),
+            w: Cell::new(false),
             vertical_mirroring,
         }
     }
@@ -130,22 +141,47 @@ impl Ppu {
         room * 0x400 + (index & 0x3FF)
     }
 
-    /// A write to PPUADDR ($2006): half of an address — big half on the
-    /// first knock, little half on the second.
-    pub fn write_address(&mut self, value: u8) {
-        let address = self.address.get();
-        if self.expecting_low.get() {
-            self.address.set((address & 0xFF00) | value as u16);
+    /// A write to PPUCTRL ($2000): the settings byte — and its bottom
+    /// two bits are secretly an address write: they stage which
+    /// nametable `t` starts from.
+    pub fn write_ctrl(&mut self, value: u8) {
+        self.ctrl = value;
+        self.t = (self.t & !0x0C00) | (((value & 0b11) as u16) << 10);
+    }
+
+    /// A write to PPUSCROLL ($2005): the camera. First knock stages
+    /// the X scroll — coarse tile into `t`, fine pixel into `x` —
+    /// and the second knock stages Y the same way, fine bits up top.
+    pub fn write_scroll(&mut self, value: u8) {
+        if self.w.get() {
+            self.t = (self.t & !0x73E0)
+                | (((value & 0b111) as u16) << 12)
+                | (((value >> 3) as u16) << 5);
         } else {
-            self.address.set((address & 0x00FF) | ((value as u16) << 8));
+            self.t = (self.t & !0x001F) | ((value >> 3) as u16);
+            self.x = value & 0b111;
         }
-        self.expecting_low.set(!self.expecting_low.get());
+        self.w.set(!self.w.get());
+    }
+
+    /// A write to PPUADDR ($2006): half of an address — big half on
+    /// the first knock, little half on the second. Both land in `t`,
+    /// and the second knock copies the whole of `t` into `v`: setting
+    /// the address and moving the camera are the same wire.
+    pub fn write_address(&mut self, value: u8) {
+        if self.w.get() {
+            self.t = (self.t & 0xFF00) | value as u16;
+            self.v.set(self.t);
+        } else {
+            self.t = (self.t & 0x00FF) | (((value & 0x3F) as u16) << 8);
+        }
+        self.w.set(!self.w.get());
     }
 
     /// A write to PPUDATA ($2007): one byte into PPU memory, wherever
     /// the address points — which then walks forward on its own.
     pub fn write_data(&mut self, value: u8) {
-        let address = self.address.get() & 0x3FFF;
+        let address = self.v.get() & 0x3FFF;
         match address {
             // Pattern tables are the cartridge's ROM: writes bounce off.
             0x0000..=0x1FFF => {}
@@ -165,7 +201,7 @@ impl Ppu {
     /// one screen-row down — when PPUCTRL asks for column order.
     fn step_address(&self) {
         let step = if self.ctrl & 0b0000_0100 != 0 { 32 } else { 1 };
-        self.address.set(self.address.get().wrapping_add(step));
+        self.v.set(self.v.get().wrapping_add(step));
     }
 
     /// A read of PPUSTATUS ($2002): reports vblank in the top bit — and
@@ -175,7 +211,7 @@ impl Ppu {
     pub fn read_status(&self) -> u8 {
         let status = (self.vblank.get() as u8) << 7;
         self.vblank.set(false);
-        self.expecting_low.set(false);
+        self.w.set(false);
         status
     }
 
@@ -185,7 +221,7 @@ impl Ppu {
     /// writing, and games lean on that to step past addresses without
     /// disturbing them.
     pub fn read_data(&self) -> u8 {
-        let address = self.address.get() & 0x3FFF;
+        let address = self.v.get() & 0x3FFF;
         let value = self.read_buffer.get();
 
         self.read_buffer.set(match address {
@@ -207,35 +243,89 @@ impl Ppu {
         self.mask & 0b0001_1000 != 0
     }
 
-    /// Fill the pockets for one tile of one scanline: which tile
-    /// (the nametable), its palette pick (the attribute table), and
-    /// its two planes of pattern bits — chapter 13's read, done by
-    /// the chip itself this time.
-    fn fetch_tile(&mut self, scanline: usize, col: usize, chr: &[u8]) {
-        // Eight pixel rows to a tile row: scanline 13 is tile row 1,
-        // five pixel rows into it.
-        let (row, fine_y) = (scanline / 8, scanline % 8);
+    /// Fill the pockets for the tile `v` names: the nametable cell
+    /// `v` points at, its palette pick, and the pattern row `v`'s
+    /// fine Y selects — the beam no longer knows where it is; it
+    /// knows what `v` says.
+    fn fetch_tile(&mut self, chr: &[u8]) {
+        let v = self.v.get();
 
-        // The nametable: a 32-wide grid of tile numbers.
-        let tile = self.vram[row * 32 + col] as usize;
+        // `v`'s low twelve bits — coarse X, coarse Y, nametable —
+        // ARE a nametable cell address, once parked behind $2000.
+        let tile = self.vram[self.mirror(0x2000 | (v & 0x0FFF))] as usize;
 
-        // The attribute table sits after the 960 tile cells, one
-        // byte per 4x4-tile block — so divide both coordinates by
-        // four to find the block's byte.
-        let attribute = self.vram[0x3C0 + (row / 4) * 8 + col / 4];
+        // The attribute byte lives in the same nametable's last 64
+        // bytes ($23C0 for the first), one byte per 4x4-tile block:
+        // keep the nametable bits, then chop both coordinates to
+        // blocks — the top three bits of coarse Y and of coarse X,
+        // packed side by side.
+        let attribute_address = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        let attribute = self.vram[self.mirror(attribute_address)];
 
-        // Inside the byte, two bits per 2x2-tile quadrant: the
-        // bottom half of the block reads the high nibble (+4), the
-        // right half reads each nibble's high pair (+2).
-        let shift = ((row % 4) / 2) * 4 + ((col % 4) / 2) * 2;
+        // Inside the byte, two bits per 2x2-tile quadrant, as ever:
+        // coarse Y's bit 1 contributes 4, coarse X's bit 1
+        // contributes 2.
+        let shift = ((v >> 4) & 0b100) | (v & 0b010);
         self.next_attr = (attribute >> shift) & 0b11;
 
         // PPUCTRL bit 4 picks the background's half of the album:
         // sixteen bytes a tile, the high plane eight bytes in.
-        let table = if self.ctrl & 0b0001_0000 != 0 { 0x1000 } else { 0 };
-        let start = table + tile * 16 + fine_y;
+        let table = if self.ctrl & 0b0001_0000 != 0 {
+            0x1000
+        } else {
+            0
+        };
+        let start = table + tile * 16 + ((v >> 12) & 0b111) as usize;
         self.next_pattern_low = chr[start];
         self.next_pattern_high = chr[start + 8];
+    }
+
+    /// One tile to the right — and off the edge of a nametable means
+    /// INTO ITS NEIGHBOR: coarse X wraps and the horizontal name bit
+    /// flips. This is what makes two screens one world.
+    fn increment_x(&self) {
+        let v = self.v.get();
+        if v & 0x001F == 31 {
+            self.v.set((v & !0x001F) ^ 0x0400);
+        } else {
+            self.v.set(v + 1);
+        }
+    }
+
+    /// One line down: fine Y first, then coarse Y — and row 29 is the
+    /// last row of a nametable, so it wraps into the neighbor below.
+    /// (Rows 30 and 31 exist — that's the attribute table's territory
+    /// — and a game that scrolls into them gets the garbage it asked
+    /// for, without the flip.)
+    fn increment_y(&self) {
+        let mut v = self.v.get();
+        if v & 0x7000 != 0x7000 {
+            self.v.set(v + 0x1000);
+            return;
+        }
+
+        v &= !0x7000;
+        let coarse_y = (v >> 5) & 0x1F;
+        match coarse_y {
+            29 => v = (v & !0x03E0) ^ 0x0800,
+            31 => v &= !0x03E0,
+            _ => v += 0x0020,
+        }
+        self.v.set(v);
+    }
+
+    /// The end-of-line reset: the horizontal half of `t` — coarse X
+    /// and the horizontal name bit — copies back into `v`.
+    fn copy_horizontal(&self) {
+        let v = self.v.get();
+        self.v.set((v & !0x041F) | (self.t & 0x041F));
+    }
+
+    /// The start-of-frame reset, on the warm-up lap: the vertical
+    /// half of `t` copies back into `v`.
+    fn copy_vertical(&self) {
+        let v = self.v.get();
+        self.v.set((v & 0x041F) | (self.t & !0x041F & 0x7FFF));
     }
 
     /// The belt advances one pixel: every register slides one bit
@@ -263,12 +353,16 @@ impl Ppu {
     /// now — which is the whole point: the belt's front IS the beam.
     fn draw_dot(&mut self, scanline: usize, x: usize) {
         let color = if self.mask & 0b0000_1000 != 0 {
-            let low = (self.shift_low >> 15) & 1;
-            let high = (self.shift_high >> 15) & 1;
+            // Fine X moves the tap: instead of always reading the
+            // belt's front bit, the beam reads `x` bits in — the
+            // whole screen slides left by up to seven pixels.
+            let tap = 15 - self.x as u16;
+            let low = (self.shift_low >> tap) & 1;
+            let high = (self.shift_high >> tap) & 1;
             let value = ((high << 1) | low) as usize;
 
             let palette =
-                (((self.attr_high >> 15) & 1) << 1 | ((self.attr_low >> 15) & 1)) as usize;
+                (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
 
             // Pattern value 0 is the shared backdrop, whichever
             // palette the neighborhood picked.
@@ -282,7 +376,7 @@ impl Ppu {
             // With rendering off and the address register parked
             // inside the crayon box, the screen shows THAT crayon —
             // the door `full_palette` draws its rainbow through.
-            let address = self.address.get() & 0x3FFF;
+            let address = self.v.get() & 0x3FFF;
             if address >= 0x3F00 {
                 let crayon = self.palette_ram[Self::palette_index(address)];
                 self.frame[scanline * 256 + x] = SYSTEM_PALETTE[crayon as usize];
@@ -316,20 +410,41 @@ impl Ppu {
             self.shift();
 
             // Boundaries land after every eighth pixel; the tile
-            // fetched here reaches the front sixteen dots later.
-            if dot % 8 == 0 && dot <= 240 {
-                self.fetch_tile(scanline, dot / 8 + 1, chr);
+            // fetched here reaches the front sixteen dots later, and
+            // `v` walks one cell right at every boundary. The fetch
+            // at dot 248 reaches past the right edge — with fine X
+            // panning, the last pixels borrow from the tile beyond,
+            // and `v` has already wrapped into the neighbor to serve
+            // them.
+            if dot % 8 == 0 && dot <= 248 {
+                self.fetch_tile(chr);
                 self.reload_shifts();
+                self.increment_x();
             }
+        }
+
+        // The line's turnarounds: at dot 256 the beam finishes its
+        // pixels and `v` steps one line down; at 257 the horizontal
+        // half snaps back to the game's chosen left edge. The warm-up
+        // lap does both, and once a frame it also restores the
+        // vertical half — the camera's Y, applied.
+        if dot == 256 {
+            self.increment_y();
+        }
+        if dot == 257 {
+            self.copy_horizontal();
+        }
+        if scanline == 261 && dot == 280 {
+            self.copy_vertical();
         }
 
         if (321..=336).contains(&dot) {
             self.shift();
 
             if dot == 328 || dot == 336 {
-                let below = if scanline == 261 { 0 } else { scanline + 1 };
-                self.fetch_tile(below, if dot == 328 { 0 } else { 1 }, chr);
+                self.fetch_tile(chr);
                 self.reload_shifts();
+                self.increment_x();
             }
         }
     }
@@ -354,14 +469,14 @@ impl Ppu {
 /// These values were computed from the signal's documented voltages
 /// (Part II does that computation live, and finds even more colors).
 pub const SYSTEM_PALETTE: [u32; 64] = [
-    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
-    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
-    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
-    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
-    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
-    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
-    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
-    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
+    0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
+    0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
+    0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
+    0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
+    0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
+    0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
+    0x000000,
 ];
 
 #[cfg(test)]
@@ -598,4 +713,94 @@ mod tests {
         ppu.tick(0, 5, &test_chr());
         assert_eq!(ppu.frame[4], SYSTEM_PALETTE[0x21]);
     }
+
+    #[test]
+    fn scroll_writes_stage_t_and_x_without_touching_v() {
+        // The NesDev wiki's own worked example: $7D then $5E.
+        let mut ppu = Ppu::new(false);
+        ppu.write_scroll(0x7D); // coarse X 15, fine X 5
+        ppu.write_scroll(0x5E); // coarse Y 11, fine Y 6
+        assert_eq!(ppu.t, (6 << 12) | (11 << 5) | 15);
+        assert_eq!(ppu.x, 5);
+        assert_eq!(ppu.v.get(), 0); // staged, not applied
+    }
+
+    #[test]
+    fn the_second_address_knock_moves_the_camera() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_address(0x21);
+        assert_eq!(ppu.v.get(), 0); // one knock: still staged
+        ppu.write_address(0x08);
+        assert_eq!(ppu.v.get(), 0x2108); // two knocks: applied
+    }
+
+    #[test]
+    fn walking_off_a_nametable_lands_in_its_neighbor() {
+        let ppu = Ppu::new(false);
+
+        // Right edge: coarse X 31 wraps to 0 and the horizontal
+        // name bit flips.
+        ppu.v.set(31);
+        ppu.increment_x();
+        assert_eq!(ppu.v.get(), 0x0400);
+
+        // Bottom edge: fine Y 7 on row 29 wraps to row 0 of the
+        // nametable below.
+        ppu.v.set((7 << 12) | (29 << 5));
+        ppu.increment_y();
+        assert_eq!(ppu.v.get(), 0x0800);
+    }
+
+    #[test]
+    fn the_warm_up_lap_applies_the_staged_camera() {
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0000_1000;
+        ppu.vram[2] = 1; // two cells in: the solid tile
+        ppu.palette_ram[3] = 0x30;
+
+        // Aim two tiles right; nothing moves yet.
+        ppu.write_scroll(16);
+        ppu.write_scroll(0);
+
+        // The warm-up lap's copy-downs apply it, then the usual
+        // priming — and the line starts two tiles into the world.
+        let chr = test_chr();
+        ppu.tick(261, 257, &chr);
+        ppu.tick(261, 280, &chr);
+        for dot in 321..=336 {
+            ppu.tick(261, dot, &chr);
+        }
+        for dot in 1..=8 {
+            ppu.tick(0, dot, &chr);
+        }
+        assert_eq!(ppu.frame[0], SYSTEM_PALETTE[0x30]);
+    }
+
+    #[test]
+    fn fine_x_slides_the_world_within_a_tile() {
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0000_1000;
+        ppu.vram[0] = 1; // solid, then blank
+        ppu.palette_ram[0] = 0x0F;
+        ppu.palette_ram[3] = 0x30;
+
+        ppu.write_scroll(4); // coarse 0, fine 4
+        ppu.write_scroll(0);
+
+        let chr = test_chr();
+        ppu.tick(261, 257, &chr);
+        ppu.tick(261, 280, &chr);
+        for dot in 321..=336 {
+            ppu.tick(261, dot, &chr);
+        }
+        for dot in 1..=8 {
+            ppu.tick(0, dot, &chr);
+        }
+
+        // The screen's first pixel is the tile's FIFTH: four white
+        // pixels remain, then the blank neighbor shows through.
+        assert_eq!(ppu.frame[3], SYSTEM_PALETTE[0x30]);
+        assert_eq!(ppu.frame[4], SYSTEM_PALETTE[0x0F]);
+    }
+
 }
