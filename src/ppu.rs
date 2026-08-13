@@ -93,9 +93,32 @@ pub struct Ppu {
     /// twice, on the SAME latch, and reading $2002 resets it.
     w: Cell<bool>,
 
+    /// $2002 bit 6: sprite zero's opaque pixel met an opaque
+    /// background pixel this frame. The flag games split screens on.
+    sprite_zero_hit: bool,
+
+    /// $2002 bit 5: a scanline wanted a ninth sprite.
+    sprite_overflow: bool,
+
+    /// OAMADDR ($2003): where the next $2004 access lands.
+    oam_addr: u8,
+
+    /// The eight (at most) sprites chosen for the line being drawn,
+    /// their pixels already decoded and flipped.
+    line_sprites: Vec<LineSprite>,
+
     /// How this cartridge's board arranges the four nametable names
     /// over the two real rooms of VRAM.
     vertical_mirroring: bool,
+}
+
+/// One sprite as the beam meets it: a single row of eight decoded
+/// pixels, parked at an X position, with its manners attached.
+struct LineSprite {
+    x: u8,
+    pixels: [u8; 8],
+    attributes: u8,
+    is_zero: bool,
 }
 
 impl Ppu {
@@ -122,6 +145,10 @@ impl Ppu {
             x: 0,
             read_buffer: Cell::new(0),
             w: Cell::new(false),
+            sprite_zero_hit: false,
+            sprite_overflow: false,
+            oam_addr: 0,
+            line_sprites: Vec::new(),
             vertical_mirroring,
         }
     }
@@ -162,6 +189,26 @@ impl Ppu {
             self.x = value & 0b111;
         }
         self.w.set(!self.w.get());
+    }
+
+    /// A write to OAMADDR ($2003): aim the roster's door.
+    pub fn write_oam_address(&mut self, value: u8) {
+        self.oam_addr = value;
+    }
+
+    /// A write to OAMDATA ($2004): one byte through the door, and
+    /// the door moves on — OAM DMA is 256 of these in a row.
+    pub fn write_oam_data(&mut self, value: u8) {
+        self.oam[self.oam_addr as usize] = value;
+        self.oam_addr = self.oam_addr.wrapping_add(1);
+    }
+
+    /// A read of OAMDATA: what the door shows, without moving it.
+    /// An attribute byte's three unwired bits read back as zero —
+    /// they simply don't exist on the chip.
+    pub fn read_oam_data(&self) -> u8 {
+        let value = self.oam[self.oam_addr as usize];
+        if self.oam_addr & 3 == 2 { value & 0xE3 } else { value }
     }
 
     /// A write to PPUADDR ($2006): half of an address — big half on
@@ -209,7 +256,9 @@ impl Ppu {
     /// register to expect a first knock. Reading, here, is touching —
     /// which is why those two fields live in `Cell`s.
     pub fn read_status(&self) -> u8 {
-        let status = (self.vblank.get() as u8) << 7;
+        let status = ((self.vblank.get() as u8) << 7)
+            | ((self.sprite_zero_hit as u8) << 6)
+            | ((self.sprite_overflow as u8) << 5);
         self.vblank.set(false);
         self.w.set(false);
         status
@@ -220,14 +269,15 @@ impl Ppu {
     /// part is that reading walks the address forward exactly like
     /// writing, and games lean on that to step past addresses without
     /// disturbing them.
-    pub fn read_data(&self) -> u8 {
+    pub fn read_data(&self, chr: &[u8]) -> u8 {
         let address = self.v.get() & 0x3FFF;
         let value = self.read_buffer.get();
 
         self.read_buffer.set(match address {
-            // Pattern tables live on the cartridge — not wired from
-            // this side of the chip yet.
-            0x0000..=0x1FFF => 0,
+            // Pattern tables: the cartridge's art, readable through
+            // the port like everything else — and some games keep
+            // level data on those chips and read it back this way.
+            0x0000..=0x1FFF => chr[address as usize],
             0x2000..=0x3EFF => self.vram[self.mirror(address)],
             _ => self.palette_ram[Self::palette_index(address)],
         });
@@ -259,7 +309,8 @@ impl Ppu {
         // keep the nametable bits, then chop both coordinates to
         // blocks — the top three bits of coarse Y and of coarse X,
         // packed side by side.
-        let attribute_address = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        let attribute_address =
+            0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
         let attribute = self.vram[self.mirror(attribute_address)];
 
         // Inside the byte, two bits per 2x2-tile quadrant, as ever:
@@ -270,11 +321,7 @@ impl Ppu {
 
         // PPUCTRL bit 4 picks the background's half of the album:
         // sixteen bytes a tile, the high plane eight bytes in.
-        let table = if self.ctrl & 0b0001_0000 != 0 {
-            0x1000
-        } else {
-            0
-        };
+        let table = if self.ctrl & 0b0001_0000 != 0 { 0x1000 } else { 0 };
         let start = table + tile * 16 + ((v >> 12) & 0b111) as usize;
         self.next_pattern_low = chr[start];
         self.next_pattern_high = chr[start + 8];
@@ -328,6 +375,100 @@ impl Ppu {
         self.v.set((v & 0x041F) | (self.t & !0x041F & 0x7FFF));
     }
 
+    /// Choose the sprites for one scanline: walk the roster in order,
+    /// keep the first eight whose rows cross the line, and decode
+    /// each one's row of pixels on the spot. Sprite zero is whoever
+    /// sits in slot zero — the flag's namesake.
+    fn evaluate_sprites(&mut self, line: usize, chr: &[u8]) {
+        self.line_sprites.clear();
+        let height = if self.ctrl & 0b0010_0000 != 0 { 16 } else { 8 };
+
+        let mut n = 0;
+        while n < 64 {
+            // OAM stores "top minus one": a sprite at Y covers
+            // lines Y+1 through Y+height.
+            let y = self.oam[n * 4] as usize;
+            let row = line.wrapping_sub(y + 1);
+            if row < height {
+                if self.line_sprites.len() == 8 {
+                    self.overflow_scan(line, n, height);
+                    return;
+                }
+                self.line_sprites.push(LineSprite {
+                    x: self.oam[n * 4 + 3],
+                    pixels: self.sprite_row(
+                        self.oam[n * 4 + 1] as usize,
+                        self.oam[n * 4 + 2],
+                        row,
+                        height,
+                        chr,
+                    ),
+                    attributes: self.oam[n * 4 + 2],
+                    is_zero: n == 0,
+                });
+            }
+            n += 1;
+        }
+    }
+
+    /// One row of one sprite, decoded and flipped. Chapter 13's
+    /// `decode_tile` finally meets the cast: flip V picks the row
+    /// from the bottom up, flip H reverses it — and a tall sprite
+    /// is two stacked tiles from the table its own number picks.
+    fn sprite_row(
+        &self,
+        tile: usize,
+        attributes: u8,
+        mut row: usize,
+        height: usize,
+        chr: &[u8],
+    ) -> [u8; 8] {
+        // Flip V reads the sprite bottom-up: row 0 becomes the last.
+        if attributes & 0b1000_0000 != 0 {
+            row = height - 1 - row;
+        }
+
+        // Which tile, from which half of the album (256 tiles each).
+        // A tall sprite carries the answer in its own number: the
+        // bottom bit picks the half, the rest names the TOP tile,
+        // and rows 8-15 come from the tile right after it. A short
+        // sprite asks PPUCTRL bit 3, exactly as chapter 17 did.
+        let (half, tile) = if height == 16 {
+            ((tile & 1) * 256, (tile & !1) + row / 8)
+        } else if self.ctrl & 0b0000_1000 != 0 {
+            (256, tile)
+        } else {
+            (0, tile)
+        };
+
+        // Chapter 13's decoder hands the whole tile back; keep one
+        // row of it — and flip H is nothing more than reversing
+        // that row.
+        let mut pixels = decode_tile(chr, half + tile)[row % 8];
+        if attributes & 0b0100_0000 != 0 {
+            pixels.reverse();
+        }
+        pixels
+    }
+
+    /// The ninth-sprite scan, bug included: the real chip means to
+    /// keep checking Y coordinates, but it increments the byte
+    /// offset alongside the sprite index — so it wanders a diagonal
+    /// through the roster, comparing X positions and tile numbers as
+    /// if they were Ys. Games learned to live with the flag it
+    /// raises; so do we, faithfully.
+    fn overflow_scan(&mut self, line: usize, from: usize, height: usize) {
+        let mut m = 0;
+        for n in from..64 {
+            let y = self.oam[n * 4 + m] as usize;
+            if line.wrapping_sub(y + 1) < height {
+                self.sprite_overflow = true;
+                return;
+            }
+            m = (m + 1) & 3;
+        }
+    }
+
     /// The belt advances one pixel: every register slides one bit
     /// toward the front.
     fn shift(&mut self) {
@@ -352,26 +493,13 @@ impl Ppu {
     /// One pixel, from whatever is at the front of the belt right
     /// now — which is the whole point: the belt's front IS the beam.
     fn draw_dot(&mut self, scanline: usize, x: usize) {
-        let color = if self.mask & 0b0000_1000 != 0 {
-            // Fine X moves the tap: instead of always reading the
-            // belt's front bit, the beam reads `x` bits in — the
-            // whole screen slides left by up to seven pixels.
-            let tap = 15 - self.x as u16;
-            let low = (self.shift_low >> tap) & 1;
-            let high = (self.shift_high >> tap) & 1;
-            let value = ((high << 1) | low) as usize;
-
-            let palette =
-                (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
-
-            // Pattern value 0 is the shared backdrop, whichever
-            // palette the neighborhood picked.
-            let crayon = if value == 0 {
-                self.palette_ram[0]
-            } else {
-                self.palette_ram[palette * 4 + value]
-            };
-            SYSTEM_PALETTE[crayon as usize]
+        // Two layers meet at every dot: the background's pixel off
+        // the belt, and whichever sprite claims this X. The referee
+        // decides, and keeps the score sprite zero cares about.
+        let color = if self.rendering() {
+            let background = self.background_pixel(x);
+            let sprite = self.sprite_pixel(x);
+            self.composite(background, sprite, x)
         } else {
             // With rendering off and the address register parked
             // inside the crayon box, the screen shows THAT crayon —
@@ -390,6 +518,84 @@ impl Ppu {
         self.frame[scanline * 256 + x] = color;
     }
 
+    /// The background's offer for this dot: its pattern value and
+    /// the crayon that goes with it. A hidden background — the mask's
+    /// layer bit, or the left-edge window over the first eight
+    /// pixels — offers value 0, which is to say: backdrop.
+    fn background_pixel(&self, x: usize) -> (usize, u8) {
+        if self.mask & 0b0000_1000 == 0 || (x < 8 && self.mask & 0b0000_0010 == 0) {
+            return (0, self.palette_ram[0]);
+        }
+
+        // Fine X moves the tap: instead of always reading the
+        // belt's front bit, the beam reads `x` bits in.
+        let tap = 15 - self.x as u16;
+        let low = (self.shift_low >> tap) & 1;
+        let high = (self.shift_high >> tap) & 1;
+        let value = ((high << 1) | low) as usize;
+
+        let palette =
+            (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
+
+        let crayon = if value == 0 {
+            self.palette_ram[0]
+        } else {
+            self.palette_ram[palette * 4 + value]
+        };
+        (value, crayon)
+    }
+
+    /// The cast's offer: the first sprite on the line with an opaque
+    /// pixel at this X wins — roster order settles fights between
+    /// sprites before priority ever meets the background.
+    fn sprite_pixel(&self, x: usize) -> Option<(usize, u8, bool)> {
+        if self.mask & 0b0001_0000 == 0 || (x < 8 && self.mask & 0b0000_0100 == 0) {
+            return None;
+        }
+
+        for sprite in &self.line_sprites {
+            let offset = x.wrapping_sub(sprite.x as usize);
+            if offset < 8 {
+                let value = sprite.pixels[offset] as usize;
+                if value != 0 {
+                    return Some((value, sprite.attributes, sprite.is_zero));
+                }
+            }
+        }
+        None
+    }
+
+    /// The referee. Sprite zero's opaque pixel meeting an opaque
+    /// background pixel raises the famous flag — except at x=255,
+    /// where the hardware never checks. Then the priority bit says
+    /// who shows: a "behind" sprite loses to scenery but still shows
+    /// through its holes.
+    fn composite(
+        &mut self,
+        background: (usize, u8),
+        sprite: Option<(usize, u8, bool)>,
+        x: usize,
+    ) -> u32 {
+        let (bg_value, bg_crayon) = background;
+
+        let Some((value, attributes, is_zero)) = sprite else {
+            return SYSTEM_PALETTE[bg_crayon as usize];
+        };
+
+        if is_zero && bg_value != 0 && x != 255 {
+            self.sprite_zero_hit = true;
+        }
+
+        let behind = attributes & 0b0010_0000 != 0;
+        if bg_value != 0 && behind {
+            return SYSTEM_PALETTE[bg_crayon as usize];
+        }
+
+        let palette = (attributes & 0b11) as usize;
+        let crayon = self.palette_ram[0x10 + palette * 4 + value];
+        SYSTEM_PALETTE[crayon as usize]
+    }
+
     /// One dot of the picture chip's day. Visible dots leave through
     /// the belt; the belt advances and the pockets refill on the
     /// schedule the beam sets; the tail of every line — warm-up lap
@@ -400,6 +606,12 @@ impl Ppu {
 
         if drawing_line && (1..=256).contains(&dot) {
             self.draw_dot(scanline, dot - 1);
+        }
+
+        // The warm-up lap wipes last frame's score, rendering or not.
+        if scanline == 261 && dot == 1 {
+            self.sprite_zero_hit = false;
+            self.sprite_overflow = false;
         }
 
         if !self.rendering() || (!drawing_line && scanline != 261) {
@@ -438,6 +650,14 @@ impl Ppu {
             self.copy_vertical();
         }
 
+        // While the beam turns around, the chip casts the next
+        // line: which eight sprites, out of sixty-four, live there.
+        // Nobody casts for line zero — a real NES shows no sprites
+        // on its first line, and now neither do we.
+        if drawing_line && dot == 257 {
+            self.evaluate_sprites(scanline + 1, chr);
+        }
+
         if (321..=336).contains(&dot) {
             self.shift();
 
@@ -469,14 +689,14 @@ impl Ppu {
 /// These values were computed from the signal's documented voltages
 /// (Part II does that computation live, and finds even more colors).
 pub const SYSTEM_PALETTE: [u32; 64] = [
-    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
-    0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
-    0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
-    0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
-    0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
-    0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
-    0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
-    0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
+    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
+    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
+    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
+    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
+    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
+    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
+    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
 ];
 
 #[cfg(test)]
@@ -613,7 +833,7 @@ mod tests {
         ppu.write_address(0x3F);
         ppu.write_address(0x00);
         ppu.write_data(0x11); // lands at $3F00
-        ppu.read_data(); // a footstep past $3F01, touching nothing
+        ppu.read_data(&[]); // a footstep past $3F01, touching nothing
         ppu.write_data(0x33); // must land at $3F02
         assert_eq!(ppu.palette_ram[0], 0x11);
         assert_eq!(ppu.palette_ram[1], 0x00); // undisturbed
@@ -629,8 +849,8 @@ mod tests {
 
         ppu.write_address(0x20);
         ppu.write_address(0x00);
-        assert_eq!(ppu.read_data(), 0x00); // the stale waiting room
-        assert_eq!(ppu.read_data(), 0x55); // yesterday's byte, today
+        assert_eq!(ppu.read_data(&[]), 0x00); // the stale waiting room
+        assert_eq!(ppu.read_data(&[]), 0x55); // yesterday's byte, today
     }
 
     #[test]
@@ -679,7 +899,7 @@ mod tests {
     #[test]
     fn the_belt_delivers_the_tile_under_the_beam() {
         let mut ppu = Ppu::new(false);
-        ppu.mask = 0b0000_1000; // background on
+        ppu.mask = 0b0000_1010; // background on, left window open
         ppu.vram[0] = 1; // first cell: the solid tile
         ppu.vram[2] = 1; // third cell: solid again
         ppu.palette_ram[0] = 0x0F; // backdrop: black
@@ -754,7 +974,7 @@ mod tests {
     #[test]
     fn the_warm_up_lap_applies_the_staged_camera() {
         let mut ppu = Ppu::new(false);
-        ppu.mask = 0b0000_1000;
+        ppu.mask = 0b0000_1010; // background on, left window open
         ppu.vram[2] = 1; // two cells in: the solid tile
         ppu.palette_ram[3] = 0x30;
 
@@ -779,7 +999,7 @@ mod tests {
     #[test]
     fn fine_x_slides_the_world_within_a_tile() {
         let mut ppu = Ppu::new(false);
-        ppu.mask = 0b0000_1000;
+        ppu.mask = 0b0000_1010; // background on, left window open
         ppu.vram[0] = 1; // solid, then blank
         ppu.palette_ram[0] = 0x0F;
         ppu.palette_ram[3] = 0x30;
@@ -803,4 +1023,146 @@ mod tests {
         assert_eq!(ppu.frame[4], SYSTEM_PALETTE[0x0F]);
     }
 
+    /// Stand a sprite in the roster: the solid tile, at a position,
+    /// with its manners.
+    fn place_sprite(ppu: &mut Ppu, slot: usize, x: u8, y: u8, attributes: u8) {
+        ppu.oam[slot * 4] = y;
+        ppu.oam[slot * 4 + 1] = 1;
+        ppu.oam[slot * 4 + 2] = attributes;
+        ppu.oam[slot * 4 + 3] = x;
+    }
+
+    /// Draw one full line the honest way: prime on the warm-up lap,
+    /// walk line 0 (which casts and primes line 1), then line 1.
+    fn draw_line_one(ppu: &mut Ppu, chr: &[u8]) {
+        for dot in 321..=336 {
+            ppu.tick(261, dot, chr);
+        }
+        for dot in 1..=340 {
+            ppu.tick(0, dot, chr);
+        }
+        for dot in 1..=256 {
+            ppu.tick(1, dot, chr);
+        }
+    }
+
+    #[test]
+    fn flips_mirror_the_sprite_not_just_its_position() {
+        // Zooming Secretary walked left in two pieces: her tiles
+        // swapped positions but nobody read bit 6, so each half
+        // faced the wrong way. This pins the mirror forever.
+        let mut chr = vec![0; 8192];
+        for row in 0..8 {
+            chr[16 + row] = 0xF0; // tile 1: left half lit...
+            chr[24 + row] = 0xF0; // ...in both planes: value 3
+        }
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0001_1110;
+        ppu.palette_ram[0] = 0x0F;
+        ppu.palette_ram[0x13] = 0x30;
+
+        place_sprite(&mut ppu, 0, 100, 49, 0);
+        ppu.evaluate_sprites(50, &chr);
+        for dot in 1..=256 {
+            ppu.tick(50, dot, &chr);
+        }
+        let row = &ppu.frame[50 * 256..51 * 256];
+        assert_eq!(row[100], SYSTEM_PALETTE[0x30]); // lit half left
+        assert_eq!(row[107], SYSTEM_PALETTE[0x0F]);
+
+        place_sprite(&mut ppu, 0, 100, 49, 0b0100_0000); // flip H
+        ppu.evaluate_sprites(50, &chr);
+        for dot in 1..=256 {
+            ppu.tick(50, dot, &chr);
+        }
+        let row = &ppu.frame[50 * 256..51 * 256];
+        assert_eq!(row[100], SYSTEM_PALETTE[0x0F]); // now mirrored
+        assert_eq!(row[107], SYSTEM_PALETTE[0x30]);
+    }
+
+    #[test]
+    fn sprite_zero_reports_the_meeting() {
+        let chr = test_chr();
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0001_1110;
+        ppu.vram[0] = 1; // scenery under the sprite's left half
+
+        place_sprite(&mut ppu, 0, 4, 0, 0); // covers lines 1-8
+        draw_line_one(&mut ppu, &chr);
+        assert!(ppu.sprite_zero_hit);
+
+        // No scenery, no meeting: same sprite over a blank world.
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0001_1110;
+        place_sprite(&mut ppu, 0, 4, 0, 0);
+        draw_line_one(&mut ppu, &chr);
+        assert!(!ppu.sprite_zero_hit);
+    }
+
+    #[test]
+    fn a_ninth_actor_raises_the_overflow_flag() {
+        let chr = test_chr();
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0001_1000;
+        for slot in 0..8 {
+            place_sprite(&mut ppu, slot, (slot * 8) as u8, 49, 0);
+        }
+        ppu.evaluate_sprites(50, &chr);
+        assert!(!ppu.sprite_overflow);
+
+        place_sprite(&mut ppu, 8, 64, 49, 0);
+        ppu.evaluate_sprites(50, &chr);
+        assert!(ppu.sprite_overflow);
+    }
+
+    #[test]
+    fn a_behind_sprite_hides_in_scenery_and_shows_in_holes() {
+        let chr = test_chr();
+        let mut ppu = Ppu::new(false);
+        ppu.mask = 0b0001_1110;
+        ppu.palette_ram[0] = 0x0F;
+        ppu.palette_ram[3] = 0x21;
+        ppu.palette_ram[0x13] = 0x30;
+        ppu.vram[1] = 1; // scenery over x8-15 only
+
+        place_sprite(&mut ppu, 0, 12, 0, 0b0010_0000); // behind
+        draw_line_one(&mut ppu, &chr);
+        let row = &ppu.frame[256..512];
+        assert_eq!(row[13], SYSTEM_PALETTE[0x21]); // scenery wins
+        assert_eq!(row[17], SYSTEM_PALETTE[0x30]); // holes don't
+    }
+
+    #[test]
+    fn the_roster_door_reads_writes_and_masks() {
+        let mut ppu = Ppu::new(false);
+        ppu.write_oam_address(5);
+        ppu.write_oam_data(0x77);
+        assert_eq!(ppu.oam[5], 0x77);
+
+        ppu.write_oam_address(6); // an attribute byte
+        ppu.write_oam_data(0xFF);
+        ppu.write_oam_address(6);
+        assert_eq!(ppu.read_oam_data(), 0xE3); // unwired bits: zero
+    }
+
+    #[test]
+    fn the_left_window_hides_the_cast() {
+        let chr = test_chr();
+        let mut ppu = Ppu::new(false);
+        ppu.palette_ram[0x13] = 0x30;
+        place_sprite(&mut ppu, 0, 2, 0, 0);
+
+        ppu.mask = 0b0001_0000; // sprites on, their window closed
+        ppu.evaluate_sprites(1, &chr);
+        for dot in 1..=8 {
+            ppu.tick(1, dot, &chr);
+        }
+        assert_ne!(ppu.frame[256 + 3], SYSTEM_PALETTE[0x30]);
+
+        ppu.mask = 0b0001_0100; // window open
+        for dot in 1..=8 {
+            ppu.tick(1, dot, &chr);
+        }
+        assert_eq!(ppu.frame[256 + 3], SYSTEM_PALETTE[0x30]);
+    }
 }

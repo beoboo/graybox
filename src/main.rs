@@ -116,7 +116,6 @@ fn main() {
             // The picture was painted during the frame, one dot at a
             // time; the window just collects it.
             buffer.copy_from_slice(&cpu.bus.ppu.frame);
-            render_sprites(cpu, &mut buffer);
 
             // A frame of picture gets its sixtieth of a second
             // of sound.
@@ -199,68 +198,6 @@ fn boot_rom(path: &str) -> Cpu {
     println!("  ...and on it goes.");
     // Hand the machine back to whoever booted it.
     cpu
-}
-
-/// Paint the 64 sprites over the finished background, roster's back
-/// to roster's front, so sprite 0 wins every overlap.
-fn render_sprites(cpu: &Cpu, buffer: &mut [u32]) {
-    let ppu = &cpu.bus.ppu;
-    let chr = &cpu.bus.cartridge.chr_rom;
-
-    // PPUCTRL bit 3: which half of the album holds sprite tiles.
-    // Games flip this bit to animate their whole cast at once.
-    let table = if ppu.ctrl & 0b0000_1000 != 0 { 256 } else { 0 };
-
-    for sprite in ppu.oam.chunks(4).rev() {
-        let (top, tile, attributes, left) =
-            (sprite[0], sprite[1], sprite[2], sprite[3]);
-
-        // Parking a sprite at the bottom edge is the "I'm not here"
-        // convention: anything from $EF down starts past row 239.
-        if top >= 0xEF {
-            continue;
-        }
-
-        let pixels = ppu::decode_tile(chr, table + tile as usize);
-        let palette = sprite_palette(ppu, attributes);
-
-        for (row, line) in pixels.iter().enumerate() {
-            // Hardware draws every sprite one row below its stored
-            // Y — games store "top minus one" and know it.
-            let y = top as usize + 1 + row;
-            if y >= HEIGHT {
-                break;
-            }
-
-            for (col, &value) in line.iter().enumerate() {
-                // Color 0 is a hole: the scenery shows through.
-                if value == 0 {
-                    continue;
-                }
-                let x = left as usize + col;
-                if x >= WIDTH {
-                    break;
-                }
-                let crayon = palette[value as usize];
-                buffer[y * WIDTH + x] = ppu::SYSTEM_PALETTE[crayon as usize];
-            }
-        }
-    }
-}
-
-/// A sprite's four crayons: attribute bits 0-1 pick one of the four
-/// sprite hands, the upper half of palette RAM. Slot 0 is listed only
-/// to keep the indexing honest — sprites never paint with it.
-fn sprite_palette(ppu: &ppu::Ppu, attributes: u8) -> [u8; 4] {
-    let which = (attributes & 0b11) as usize;
-    let base = 0x10 + which * 4;
-
-    [
-        0,
-        ppu.palette_ram[base + 1],
-        ppu.palette_ram[base + 2],
-        ppu.palette_ram[base + 3],
-    ]
 }
 
 /// The speaker's end of the machine: the stream that plays (sound

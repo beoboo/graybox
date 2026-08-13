@@ -58,7 +58,8 @@ impl Bus {
             // both change state when looked at.
             0x2000..=0x3FFF => match address & 0x0007 {
                 0x0002 => self.ppu.read_status(),
-                0x0007 => self.ppu.read_data(),
+                0x0007 => self.ppu.read_data(&self.cartridge.chr_rom),
+                0x0004 => self.ppu.read_oam_data(),
                 _ => 0,
             },
 
@@ -84,10 +85,10 @@ impl Bus {
                 0x0000 => self.ppu.write_ctrl(value),
                 0x0006 => self.ppu.write_address(value),
                 0x0007 => self.ppu.write_data(value),
-                // The mask lands; scroll and the sprite pair still
-                // wait for their chapters.
                 0x0001 => self.ppu.mask = value,
                 0x0005 => self.ppu.write_scroll(value),
+                0x0003 => self.ppu.write_oam_address(value),
+                0x0004 => self.ppu.write_oam_data(value),
                 _ => {}
             },
 
@@ -102,7 +103,7 @@ impl Bus {
                 let base = (value as u16) << 8;
                 for offset in 0..256u16 {
                     let byte = self.read(base + offset);
-                    self.ppu.oam[offset as usize] = byte;
+                    self.ppu.write_oam_data(byte);
                 }
             }
 

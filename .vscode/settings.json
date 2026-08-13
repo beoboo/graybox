@@ -1,8 +1,14 @@
 {
     "cSpell.words": [
         "nametable",
+        "nametables",
         "nestest",
+        "PPUADDR",
         "PPUCTRL",
+        "PPUDATA",
+        "PPUMASK",
+        "PPUSCROLL",
+        "PPUSTATUS",
         "scanline",
         "scanlines",
         "vblank"

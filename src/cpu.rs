@@ -33,7 +33,6 @@ pub struct Cpu {
     /// Set by the indexed addressing modes when adding the index
     /// stepped into the next page — the readers' one-cycle surcharge.
     crossed: bool,
-
     /// Raised when the clock crosses into vblank with the NMI armed.
     /// The interrupt itself fires between instructions — the hardware
     /// finishes what it started before answering the tap.
