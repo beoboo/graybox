@@ -19,7 +19,7 @@ pub struct Cpu {
     /// The only 16-bit pocket, because addresses are 16 bits.
     pub pc: u16,
 
-    /// The stack pointer — where in page one the next push lands.
+    /// The stack pointer — the bookmark for chapter 8's clever gadget.
     pub sp: u8,
 
     /// The status byte: eight tiny yes/no flags packed into one byte.

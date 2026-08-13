@@ -54,6 +54,11 @@ pub struct Ppu {
     /// the beam walks. `main` collects it when the frame completes.
     pub frame: Vec<u32>,
 
+    /// All 512 colors the chip can emit — 64 crayons under each of
+    /// the eight emphasis settings — decoded from the video signal
+    /// when the machine powers on.
+    colors: Vec<u32>,
+
     /// The conveyor: pattern bits for the tile being drawn and the
     /// tile behind it. The front pixel leaves from bit 15.
     shift_low: u16,
@@ -132,6 +137,7 @@ impl Ppu {
             ctrl: 0,
             mask: 0,
             frame: vec![0; 256 * 240],
+            colors: (0..512).map(decode_color).collect(),
             shift_low: 0,
             shift_high: 0,
             attr_low: 0,
@@ -208,7 +214,11 @@ impl Ppu {
     /// they simply don't exist on the chip.
     pub fn read_oam_data(&self) -> u8 {
         let value = self.oam[self.oam_addr as usize];
-        if self.oam_addr & 3 == 2 { value & 0xE3 } else { value }
+        if self.oam_addr & 3 == 2 {
+            value & 0xE3
+        } else {
+            value
+        }
     }
 
     /// A write to PPUADDR ($2006): half of an address — big half on
@@ -309,8 +319,7 @@ impl Ppu {
         // keep the nametable bits, then chop both coordinates to
         // blocks — the top three bits of coarse Y and of coarse X,
         // packed side by side.
-        let attribute_address =
-            0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        let attribute_address = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
         let attribute = self.vram[self.mirror(attribute_address)];
 
         // Inside the byte, two bits per 2x2-tile quadrant, as ever:
@@ -321,7 +330,11 @@ impl Ppu {
 
         // PPUCTRL bit 4 picks the background's half of the album:
         // sixteen bytes a tile, the high plane eight bytes in.
-        let table = if self.ctrl & 0b0001_0000 != 0 { 0x1000 } else { 0 };
+        let table = if self.ctrl & 0b0001_0000 != 0 {
+            0x1000
+        } else {
+            0
+        };
         let start = table + tile * 16 + ((v >> 12) & 0b111) as usize;
         self.next_pattern_low = chr[start];
         self.next_pattern_high = chr[start + 8];
@@ -493,13 +506,13 @@ impl Ppu {
     /// One pixel, from whatever is at the front of the belt right
     /// now — which is the whole point: the belt's front IS the beam.
     fn draw_dot(&mut self, scanline: usize, x: usize) {
-        // Two layers meet at every dot: the background's pixel off
-        // the belt, and whichever sprite claims this X. The referee
-        // decides, and keeps the score sprite zero cares about.
+        // Two layers meet at every dot; the referee picks a crayon,
+        // and the mask has the last word on what color it makes.
         let color = if self.rendering() {
             let background = self.background_pixel(x);
             let sprite = self.sprite_pixel(x);
-            self.composite(background, sprite, x)
+            let crayon = self.composite(background, sprite, x);
+            self.color(crayon)
         } else {
             // With rendering off and the address register parked
             // inside the crayon box, the screen shows THAT crayon —
@@ -507,12 +520,12 @@ impl Ppu {
             let address = self.v.get() & 0x3FFF;
             if address >= 0x3F00 {
                 let crayon = self.palette_ram[Self::palette_index(address)];
-                self.frame[scanline * 256 + x] = SYSTEM_PALETTE[crayon as usize];
+                self.frame[scanline * 256 + x] = self.color(crayon);
                 return;
             }
 
             // The background is hidden: the dot is backdrop.
-            SYSTEM_PALETTE[self.palette_ram[0] as usize]
+            self.color(self.palette_ram[0])
         };
 
         self.frame[scanline * 256 + x] = color;
@@ -534,8 +547,7 @@ impl Ppu {
         let high = (self.shift_high >> tap) & 1;
         let value = ((high << 1) | low) as usize;
 
-        let palette =
-            (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
+        let palette = (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
 
         let crayon = if value == 0 {
             self.palette_ram[0]
@@ -569,17 +581,18 @@ impl Ppu {
     /// background pixel raises the famous flag — except at x=255,
     /// where the hardware never checks. Then the priority bit says
     /// who shows: a "behind" sprite loses to scenery but still shows
-    /// through its holes.
+    /// through its holes. The answer is a CRAYON — what color it
+    /// makes is between the mask and the signal.
     fn composite(
         &mut self,
         background: (usize, u8),
         sprite: Option<(usize, u8, bool)>,
         x: usize,
-    ) -> u32 {
+    ) -> u8 {
         let (bg_value, bg_crayon) = background;
 
         let Some((value, attributes, is_zero)) = sprite else {
-            return SYSTEM_PALETTE[bg_crayon as usize];
+            return bg_crayon;
         };
 
         if is_zero && bg_value != 0 && x != 255 {
@@ -588,12 +601,11 @@ impl Ppu {
 
         let behind = attributes & 0b0010_0000 != 0;
         if bg_value != 0 && behind {
-            return SYSTEM_PALETTE[bg_crayon as usize];
+            return bg_crayon;
         }
 
         let palette = (attributes & 0b11) as usize;
-        let crayon = self.palette_ram[0x10 + palette * 4 + value];
-        SYSTEM_PALETTE[crayon as usize]
+        self.palette_ram[0x10 + palette * 4 + value]
     }
 
     /// One dot of the picture chip's day. Visible dots leave through
@@ -669,6 +681,21 @@ impl Ppu {
         }
     }
 
+    /// A crayon, seen through the mask: greyscale (bit 0) forces it
+    /// onto the grey column before anything else sees it, and the
+    /// top three bits pick which of the eight emphasis palettes the
+    /// color is read from.
+    fn color(&self, crayon: u8) -> u32 {
+        let crayon = if self.mask & 0b0000_0001 != 0 {
+            crayon & 0x30
+        } else {
+            crayon & 0x3F
+        };
+
+        let emphasis = (self.mask as usize >> 5) & 0b111;
+        self.colors[(emphasis << 6) | crayon as usize]
+    }
+
     /// The crayon box folds: $3F10, $3F14, $3F18 and $3F1C are the
     /// same cells as $3F00, $3F04, $3F08 and $3F0C — one shared
     /// backdrop column for backgrounds and sprites alike.
@@ -682,6 +709,98 @@ impl Ppu {
     }
 }
 
+/// Voltages the signal sits at for black and for white, measured
+/// against the sync level — the numbers straight off the datasheet.
+const BLACK_LEVEL: f32 = 0.518;
+const WHITE_LEVEL: f32 = 1.962;
+
+/// How much a de-emphasis bit darkens the samples it reaches.
+const ATTENUATION: f32 = 0.746;
+
+/// The two voltages a color's square wave swings between, by
+/// brightness: the low four are the trough, the high four the crest.
+const SIGNAL_LEVELS: [f32; 8] = [0.350, 0.518, 0.962, 1.550, 1.094, 1.506, 1.962, 1.962];
+
+/// Whether sample `p` of the twelve falls in the half-cycle where
+/// `hue`'s wave is high. Twelve samples make one color cycle; a hue
+/// is nothing but a phase offset into it.
+fn in_phase(hue: i32, p: i32) -> bool {
+    (hue + p + 8) % 12 < 6
+}
+
+/// Decode one of the 512 entries — crayon in the low six bits,
+/// emphasis in the top three — from the signal it would put on the
+/// wire: build the square wave, darken what emphasis reaches, then
+/// demodulate it the way a television would and convert to RGB.
+fn decode_color(index: usize) -> u32 {
+    let hue = (index & 0x0F) as i32;
+    let mut level = ((index >> 4) & 0x03) as i32;
+    let emphasis = (index >> 6) & 0x07;
+
+    // Hues 14 and 15 ignore their brightness bits entirely.
+    if hue > 13 {
+        level = 1;
+    }
+
+    let mut low = SIGNAL_LEVELS[level as usize];
+    let mut high = SIGNAL_LEVELS[4 + level as usize];
+
+    // Hue 0 never drops and hues 13-15 never rise: the grey column
+    // and the black column, where a flat wave means no color at all.
+    if hue == 0 {
+        low = high;
+    }
+    if hue >= 13 {
+        high = low;
+    }
+
+    let (mut y, mut i, mut q) = (0.0f32, 0.0f32, 0.0f32);
+    for p in 0..12 {
+        let mut spot = if in_phase(hue, p) { high } else { low };
+
+        // Each de-emphasis bit darkens the samples in phase with one
+        // primary — red at 12, green at 4, blue at 8. Not a uniform
+        // dimming: a different slice of every hue's wave, which is
+        // why 512 entries cannot fold back down to 64 and a number.
+        if (emphasis & 1 != 0 && in_phase(12, p))
+            || (emphasis & 2 != 0 && in_phase(4, p))
+            || (emphasis & 4 != 0 && in_phase(8, p))
+        {
+            spot *= ATTENUATION;
+        }
+
+        // Normalize against black and white, then demodulate: the
+        // average is brightness, and the projections onto the color
+        // carrier's two phases are the color.
+        let v = (spot - BLACK_LEVEL) / (WHITE_LEVEL - BLACK_LEVEL) / 12.0;
+        let phase = std::f32::consts::PI * (p as f32) / 6.0;
+        y += v;
+        i += v * phase.cos();
+        q += v * phase.sin();
+    }
+
+    // A wave averaged against itself over a cycle comes out at half
+    // strength; put the halves back.
+    i *= 2.0;
+    q *= 2.0;
+
+    // YIQ to RGB by the broadcast matrix, with the gamma bend a CRT
+    // would have applied — skip it and everything washes out.
+    let channel = |value: f32| -> u32 {
+        let bent = if value <= 0.0 {
+            0.0
+        } else {
+            value.powf(2.2 / 1.8)
+        };
+        (bent * 255.0).clamp(0.0, 255.0) as u32
+    };
+
+    let r = channel(y + 0.946_882 * i + 0.623_557 * q);
+    let g = channel(y - 0.274_788 * i - 0.635_691 * q);
+    let b = channel(y - 1.108_545 * i + 1.709_007 * q);
+    (r << 16) | (g << 8) | b
+}
+
 /// The NES's whole crayon box: the 64 colors it can ever show, as RGB.
 ///
 /// The real chip stores no RGB anywhere — it emits an analog TV signal,
@@ -689,14 +808,14 @@ impl Ppu {
 /// These values were computed from the signal's documented voltages
 /// (Part II does that computation live, and finds even more colors).
 pub const SYSTEM_PALETTE: [u32; 64] = [
-    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
-    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
-    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
-    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
-    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
-    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
-    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
-    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
+    0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
+    0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
+    0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
+    0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
+    0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
+    0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
+    0x000000,
 ];
 
 #[cfg(test)]
@@ -1164,5 +1283,51 @@ mod tests {
             ppu.tick(1, dot, &chr);
         }
         assert_eq!(ppu.frame[256 + 3], SYSTEM_PALETTE[0x30]);
+    }
+
+    #[test]
+    fn the_computation_reproduces_chapter_14s_table() {
+        // The table you typed in chapter 14 was the output of this
+        // exact decoding, done ahead of time. Now the machine does
+        // its own homework — and must get the same 64 answers.
+        let ppu = Ppu::new(false);
+        for crayon in 0..64 {
+            assert_eq!(
+                ppu.colors[crayon], SYSTEM_PALETTE[crayon],
+                "crayon {crayon:#04X} decoded differently than the table"
+            );
+        }
+    }
+
+    #[test]
+    fn every_emphasis_setting_is_its_own_palette() {
+        let ppu = Ppu::new(false);
+        for emphasis in 1..8 {
+            let plain = &ppu.colors[..64];
+            let dimmed = &ppu.colors[emphasis * 64..emphasis * 64 + 64];
+            assert_ne!(plain, dimmed);
+        }
+    }
+
+    #[test]
+    fn the_mask_greys_and_dims() {
+        let mut ppu = Ppu::new(false);
+        let plain = ppu.color(0x21);
+
+        ppu.mask = 0b0000_0001; // greyscale: the hue drops away
+        assert_eq!(ppu.color(0x21), ppu.color(0x20));
+
+        ppu.mask = 0b0010_0000; // red emphasis: same crayon, dimmed
+        assert_ne!(ppu.color(0x21), plain);
+    }
+
+    #[test]
+    fn the_forbidden_crayon_has_grey_cousins() {
+        // Chapter 14's curious box: $0D sits below black. Its column
+        // is not all black, though — $3D is a true light grey. The
+        // signal knows the difference even where a table shrugs.
+        let ppu = Ppu::new(false);
+        assert_eq!(ppu.colors[0x0D], 0);
+        assert!(ppu.colors[0x3D] >> 16 > 100);
     }
 }

@@ -50,16 +50,13 @@ impl Bus {
             // same bytes answer again at $0800, $1000, and $1800.
             0x0000..=0x1FFF => self.ram[address as usize % 2048],
 
-            // The cartridge's program ROM.
-            0x8000..=0xFFFF => self.cartridge.read_prg(address),
-
             // The picture chip's eight registers, echoed every eight
             // bytes to the top of the range. Two answer reads — and
             // both change state when looked at.
             0x2000..=0x3FFF => match address & 0x0007 {
                 0x0002 => self.ppu.read_status(),
-                0x0007 => self.ppu.read_data(&self.cartridge.chr_rom),
                 0x0004 => self.ppu.read_oam_data(),
+                0x0007 => self.ppu.read_data(&self.cartridge.chr_rom),
                 _ => 0,
             },
 
@@ -71,6 +68,9 @@ impl Bus {
 
             // Cartridge territory that NROM boards leave unwired.
             0x4020..=0x7FFF => 0,
+
+            // The cartridge's program ROM.
+            0x8000..=0xFFFF => self.cartridge.read_prg(address),
         }
     }
 
@@ -83,17 +83,14 @@ impl Bus {
             // on: settings, the address, the data.
             0x2000..=0x3FFF => match address & 0x0007 {
                 0x0000 => self.ppu.write_ctrl(value),
-                0x0006 => self.ppu.write_address(value),
-                0x0007 => self.ppu.write_data(value),
                 0x0001 => self.ppu.mask = value,
-                0x0005 => self.ppu.write_scroll(value),
                 0x0003 => self.ppu.write_oam_address(value),
                 0x0004 => self.ppu.write_oam_data(value),
+                0x0005 => self.ppu.write_scroll(value),
+                0x0006 => self.ppu.write_address(value),
+                0x0007 => self.ppu.write_data(value),
                 _ => {}
             },
-
-            // The controller's strobe line.
-            0x4016 => self.controller.write(value),
 
             // Sprite memory's fast lane: one write here streams a
             // whole 256-byte page of RAM into OAM. On hardware the
@@ -106,6 +103,9 @@ impl Bus {
                     self.ppu.write_oam_data(byte);
                 }
             }
+
+            // The controller's strobe line.
+            0x4016 => self.controller.write(value),
 
             // Everything else on the sound chip's page: the APU's
             // registers. ($4014 and $4016 were claimed above; $4017,
