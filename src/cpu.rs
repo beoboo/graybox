@@ -621,7 +621,15 @@ impl Cpu {
                 self.push_word(self.pc);
                 self.push(self.status | 0b0011_0000);
                 self.status |= FLAG_INTERRUPT_DISABLE;
-                self.pc = self.read_word(0xFFFE);
+                // An NMI arriving mid-BRK hijacks it: the pushes are
+                // already done, so only the destination changes.
+                let vector = if self.nmi_pending.get() {
+                    self.nmi_pending.set(false);
+                    0xFFFA
+                } else {
+                    0xFFFE
+                };
+                self.pc = self.read_word(vector);
             }
 
             // JAM — an unofficial opcode that genuinely freezes a real
@@ -1040,15 +1048,7 @@ impl Cpu {
         self.push_word(self.pc);
         self.push((self.status | 0b0010_0000) & !0b0001_0000);
         self.status |= FLAG_INTERRUPT_DISABLE;
-        // An NMI arriving mid-BRK hijacks it: the pushes are
-        // already done, so only the destination changes.
-        let vector = if self.nmi_pending.get() {
-            self.nmi_pending.set(false);
-            0xFFFA
-        } else {
-            0xFFFE
-        };
-        self.pc = self.read_word(vector);
+        self.pc = self.read_word(0xFFFA);
 
         // Taking an interrupt is not free: seven cycles, same as BRK.
         self.cycles += 7;
