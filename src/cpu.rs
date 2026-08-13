@@ -2,6 +2,7 @@
 
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
+use std::cell::Cell;
 
 /// The CPU: a handful of small "pockets" (registers) and the memory it
 /// reads and writes.
@@ -33,10 +34,16 @@ pub struct Cpu {
     /// Set by the indexed addressing modes when adding the index
     /// stepped into the next page — the readers' one-cycle surcharge.
     crossed: bool,
-    /// Raised when the clock crosses into vblank with the NMI armed.
-    /// The interrupt itself fires between instructions — the hardware
-    /// finishes what it started before answering the tap.
-    nmi_pending: bool,
+
+    /// Raised when the clock crosses into vblank with the NMI armed;
+    /// the interrupt fires between instructions. A `Cell`, because a
+    /// $2002 read can snatch it back — that is the suppression race.
+    nmi_pending: Cell<bool>,
+
+    /// An NMI armed by a WRITE arrives one instruction late: the
+    /// write rides the final cycle, after this instruction's poll,
+    /// so the tap waits out one more instruction first.
+    nmi_delay: Cell<bool>,
 
     /// The bus: everything the CPU can reach lives on its far side.
     pub bus: Bus,
@@ -136,18 +143,45 @@ impl Cpu {
             status: 0,
             cycles: 0,
             crossed: false,
-            nmi_pending: false,
+            nmi_pending: Cell::new(false),
+            nmi_delay: Cell::new(false),
             bus: Bus::new(cartridge),
         }
     }
 
     /// Read one byte — by asking the bus.
     pub fn read(&self, address: u16) -> u8 {
+        // The race, honored: a $2002 read in the same instant the
+        // tap is being raised takes the flag home and keeps the tap
+        // from ever landing. Games fear this; now they can.
+        if (0x2000..=0x3FFF).contains(&address) && address & 0x0007 == 0x0002 {
+            self.nmi_pending.set(false);
+            self.nmi_delay.set(false);
+        }
+
         self.bus.read(address)
     }
 
     /// Store one byte — by telling the bus.
     pub fn write(&mut self, address: u16, value: u8) {
+        // $2000 moves the NMI's arming edge: switching bit 7 on
+        // while the flag is already up taps the shoulder right now;
+        // switching it off in time withdraws a pending tap.
+        if (0x2000..=0x3FFF).contains(&address) && address & 0x0007 == 0 {
+            let was_armed = self.bus.ppu.ctrl & 0x80 != 0;
+            self.bus.write(address, value);
+
+            let armed = self.bus.ppu.ctrl & 0x80 != 0;
+            if !was_armed && armed && self.bus.ppu.vblank.get() {
+                self.nmi_delay.set(true);
+            }
+            if !armed {
+                self.nmi_pending.set(false);
+                self.nmi_delay.set(false);
+            }
+            return;
+        }
+
         self.bus.write(address, value)
     }
 
@@ -279,6 +313,13 @@ impl Cpu {
         // Surcharges, where they apply, get added along the way.
         self.cycles += CYCLES[opcode as usize] as u64;
         self.crossed = false;
+
+        // Prepay the journey: every cycle of this instruction except
+        // the last ticks by BEFORE the work happens. On a 6502 the
+        // data access rides the final cycle — so whatever this
+        // instruction reads or writes does so on its true dot.
+        let prepaid = (CYCLES[opcode as usize] as u64).saturating_sub(1);
+        self.advance_clock(prepaid);
 
         // DECODE and EXECUTE: recognize the opcode, do what it says.
         match opcode {
@@ -598,14 +639,21 @@ impl Cpu {
             self.cycles += 1;
         }
 
-        // Time passes: three dots for every cycle spent. If the
-        // ticks crossed into vblank with the NMI armed, the tap
-        // lands here, before the next instruction fetches.
-        self.advance_clock(self.cycles - before);
-        if self.nmi_pending {
-            self.nmi_pending = false;
+        // Settle the final cycle and any surcharges, then answer the
+        // taps: the NMI first — unless a $2002 read just snatched it
+        // away — and the IRQ line only when the I flag allows.
+        self.advance_clock((self.cycles - before) - prepaid);
+        if self.nmi_pending.get() {
+            self.nmi_pending.set(false);
             self.nmi();
             self.advance_clock(7);
+        } else if self.bus.irq_line && self.status & FLAG_INTERRUPT_DISABLE == 0 {
+            self.irq();
+            self.advance_clock(7);
+        }
+        if self.nmi_delay.get() {
+            self.nmi_delay.set(false);
+            self.nmi_pending.set(true);
         }
 
         true
@@ -642,7 +690,7 @@ impl Cpu {
             if self.bus.clock.scanline == 241 && self.bus.clock.dot == 1 {
                 self.bus.ppu.vblank.set(true);
                 if self.bus.ppu.ctrl & 0b1000_0000 != 0 {
-                    self.nmi_pending = true;
+                    self.nmi_pending.set(true);
                 }
             }
 
@@ -992,9 +1040,36 @@ impl Cpu {
         self.push_word(self.pc);
         self.push((self.status | 0b0010_0000) & !0b0001_0000);
         self.status |= FLAG_INTERRUPT_DISABLE;
-        self.pc = self.read_word(0xFFFA);
+        // An NMI arriving mid-BRK hijacks it: the pushes are
+        // already done, so only the destination changes.
+        let vector = if self.nmi_pending.get() {
+            self.nmi_pending.set(false);
+            0xFFFA
+        } else {
+            0xFFFE
+        };
+        self.pc = self.read_word(vector);
 
         // Taking an interrupt is not free: seven cycles, same as BRK.
+        self.cycles += 7;
+    }
+
+    /// The maskable interrupt — the polite tap. Same bow as the NMI,
+    /// humbler vector, refusable via the I flag. And if an NMI
+    /// arrives mid-bow, it hijacks the sequence: the pushes are
+    /// shared, and the urgent vector wins.
+    fn irq(&mut self) {
+        self.push_word(self.pc);
+        self.push((self.status | 0b0010_0000) & !0b0001_0000);
+        self.status |= FLAG_INTERRUPT_DISABLE;
+
+        let vector = if self.nmi_pending.get() {
+            self.nmi_pending.set(false);
+            0xFFFA
+        } else {
+            0xFFFE
+        };
+        self.pc = self.read_word(vector);
         self.cycles += 7;
     }
 
@@ -1137,6 +1212,12 @@ mod tests {
         prg[0x1000] = 0x02;
         prg[0x3FFE] = 0x00; // the IRQ vector: $9000
         prg[0x3FFF] = 0x90;
+
+        // Interrupt tests need the NMI's own landing pad: $9100
+        // holds another JAM, and the NMI vector points at it.
+        prg[0x1100] = 0x02;
+        prg[0x3FFA] = 0x00; // the NMI vector: $9100
+        prg[0x3FFB] = 0x91;
 
         Cartridge {
             prg_rom: prg,
@@ -1830,7 +1911,11 @@ mod tests {
         cpu.bus.write(0x2001, 0b0000_1000);
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (2, 0, 0)
         );
 
@@ -1839,8 +1924,63 @@ mod tests {
         let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (1, 261, 340)
         );
+    }
+    #[test]
+    fn arming_the_nmi_during_vblank_taps_immediately() {
+        // LDA #$80, STA $2000, NOP: switching the NMI on while the
+        // flag is up taps the shoulder — after ONE more instruction,
+        // because the write rides the final cycle, past the poll.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA9, 0x80, 0x8D, 0x00, 0x20, 0xEA]));
+        cpu.reset();
+        cpu.bus.ppu.vblank.set(true);
+
+        cpu.step();
+        cpu.step();
+        assert_eq!(cpu.pc, 0x8005); // not yet: the poll was passed
+        cpu.step();
+        assert_eq!(cpu.pc, 0x9100); // one instruction later, the pad
+    }
+
+    #[test]
+    fn a_2002_read_snatches_a_pending_tap() {
+        let cpu = Cpu::new(test_cartridge(&[]));
+        cpu.nmi_pending.set(true);
+        cpu.read(0x2002);
+        assert!(!cpu.nmi_pending.get()); // the suppression race
+    }
+
+    #[test]
+    fn the_irq_line_waits_for_permission() {
+        // With I set (reset leaves it set), the line is refused.
+        let mut cpu = Cpu::new(test_cartridge(&[0xEA]));
+        cpu.reset();
+        cpu.bus.irq_line = true;
+        cpu.step();
+        assert_eq!(cpu.pc, 0x8001);
+
+        // CLI opens the door, and the tap lands at once.
+        let mut cpu = Cpu::new(test_cartridge(&[0x58]));
+        cpu.reset();
+        cpu.bus.irq_line = true;
+        cpu.step();
+        assert_eq!(cpu.pc, 0x9000); // the IRQ's pad
+    }
+
+    #[test]
+    fn an_nmi_hijacks_a_brk_in_flight() {
+        let mut cpu = Cpu::new(test_cartridge(&[0x00]));
+        cpu.reset();
+        cpu.nmi_pending.set(true);
+
+        cpu.step();
+        assert_eq!(cpu.pc, 0x9100); // BRK bowed; the NMI took the vector
+        assert!(!cpu.nmi_pending.get());
     }
 }

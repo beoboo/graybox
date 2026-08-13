@@ -25,6 +25,12 @@ pub struct Bus {
 
     /// The metronome: where the beam is, dot by dot.
     pub clock: Clock,
+
+    /// The interrupt-request line: any device on the bus may hold it
+    /// high, and the CPU answers between instructions if the I flag
+    /// allows. Nobody drives it yet; cartridges and the sound chip
+    /// will.
+    pub irq_line: bool,
 }
 
 impl Bus {
@@ -37,6 +43,7 @@ impl Bus {
             controller: Controller::new(),
             apu: Apu::new(),
             clock: Clock::new(),
+            irq_line: false,
             cartridge,
         }
     }
