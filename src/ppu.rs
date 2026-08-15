@@ -696,6 +696,19 @@ impl Ppu {
             self.copy_vertical();
         }
 
+        // The cadence's sprite errand, run on EVERY line including
+        // the warm-up lap: even an empty cast fetches from the
+        // sprites' half of the album, and a board that counts the
+        // beam's errands is listening for exactly that.
+        if dot == 257 {
+            let base = if self.ctrl & 0b0010_1000 != 0 {
+                0x1000
+            } else {
+                0
+            };
+            cart.read_chr(base);
+        }
+
         // While the beam turns around, the chip casts the next
         // line: which eight sprites, out of sixty-four, live there.
         // Nobody casts for line zero — a real NES shows no sprites
@@ -1037,6 +1050,15 @@ mod tests {
             chr0: 0,
             chr1: 0,
             prg: 0,
+            select: 0,
+            banks: [0; 8],
+            mmc3_horizontal: false,
+            irq_latch: 0,
+            irq_counter: Cell::new(0),
+            irq_reload: Cell::new(false),
+            irq_enabled: false,
+            irq_flag: Cell::new(false),
+            a12_was_low: Cell::new(true),
         }
     }
 

@@ -1,5 +1,7 @@
 //! The cartridge — the game itself.
 
+use std::cell::Cell;
+
 /// The four ways a board can wire the picture chip's two rooms of
 /// name RAM over the four addressable names. Part I met the first
 /// two; the single-screen pair arrives with boards that can choose.
@@ -48,6 +50,28 @@ pub struct Cartridge {
     pub chr0: u8,
     pub chr1: u8,
     pub prg: u8,
+    /// MMC3's bank plumbing: which register the next $8001 write
+    /// fills (plus the two mode bits riding above), and the eight
+    /// registers themselves.
+    pub select: u8,
+    pub banks: [u8; 8],
+
+    /// MMC3's own mirroring switch, set through $A000.
+    pub mmc3_horizontal: bool,
+
+    /// The scanline counter: the value it reloads from, the count
+    /// itself, a flag asking for a reload, whether the IRQ is
+    /// enabled, and the IRQ's own flag. `Cell`s, because the counter
+    /// is clocked by the picture chip's READS.
+    pub irq_latch: u8,
+    pub irq_counter: Cell<u8>,
+    pub irq_reload: Cell<bool>,
+    pub irq_enabled: bool,
+    pub irq_flag: Cell<bool>,
+
+    /// The last state of address line 12 — the counter clocks on its
+    /// rising edge, once per low-then-high.
+    pub a12_was_low: Cell<bool>,
 }
 
 impl Cartridge {
@@ -100,6 +124,15 @@ impl Cartridge {
             chr0: 0,
             chr1: 0,
             prg: 0,
+            select: 0,
+            banks: [0; 8],
+            mmc3_horizontal: false,
+            irq_latch: 0,
+            irq_counter: Cell::new(0),
+            irq_reload: Cell::new(false),
+            irq_enabled: false,
+            irq_flag: Cell::new(false),
+            a12_was_low: Cell::new(true),
         })
     }
 
@@ -144,6 +177,22 @@ impl Cartridge {
                 }
             }
 
+            // MMC3: four 8 KiB quarters. R6 and R7 place two of
+            // them; the last quarter is bolted down, and the
+            // second-to-last trades places with R6 when the PRG
+            // mode bit flips.
+            4 => {
+                let quarters = self.prg_rom.len() / (8 * 1024);
+                let quarter = offset / (8 * 1024);
+                let swap = self.select & 0x40 != 0;
+                let bank = match (quarter, swap) {
+                    (0, false) | (2, true) => self.banks[6] as usize,
+                    (1, _) => self.banks[7] as usize,
+                    (0, true) | (2, false) => quarters - 2,
+                    _ => quarters - 1,
+                };
+                (bank % quarters) * 8 * 1024 + (offset % (8 * 1024))
+            }
 
             // NROM and CNROM: no PRG tricks, the modulo is the wire.
             _ => offset % self.prg_rom.len(),
@@ -158,6 +207,7 @@ impl Cartridge {
             1 => self.mmc1_serial(address, value),
             2 => self.prg_bank = value & 0x0F,
             3 => self.chr_bank = value & 0x03,
+            4 => self.mmc3_registers(address, value),
             _ => {}
         }
     }
@@ -188,10 +238,36 @@ impl Cartridge {
         self.shift = 0b1_0000;
     }
 
+    /// MMC3 pairs its registers: even addresses pick and configure,
+    /// odd addresses deliver. The last pair arms and disarms the
+    /// scanline IRQ — and disarming also apologizes for any IRQ
+    /// still waiting.
+    fn mmc3_registers(&mut self, address: u16, value: u8) {
+        match (address & 0xE000, address & 1) {
+            (0x8000, 0) => self.select = value,
+            (0x8000, 1) => self.banks[(self.select & 7) as usize] = value,
+            (0xA000, 0) => self.mmc3_horizontal = value & 1 != 0,
+            (0xC000, 0) => self.irq_latch = value,
+            (0xC000, 1) => self.irq_reload.set(true),
+            (0xE000, 0) => {
+                self.irq_enabled = false;
+                self.irq_flag.set(false);
+            }
+            (0xE000, 1) => self.irq_enabled = true,
+            _ => {}
+        }
+    }
+
     /// Read one byte of the album, through the board: CHR RAM if the
     /// album is blank, a chosen bank if the board switches, plain
     /// ROM otherwise.
     pub fn read_chr(&self, address: u16) -> u8 {
+        // MMC3 wiretaps this very function: address line 12 divides
+        // the album's halves, and the board counts its rises.
+        if self.mapper == 4 {
+            self.clock_a12(address);
+        }
+
         let address = address as usize;
         if !self.chr_ram.is_empty() {
             return self.chr_ram[address];
@@ -212,6 +288,24 @@ impl Cartridge {
                 }
             }
             3 => self.chr_bank as usize * 8 * 1024 + address,
+            // MMC3 slices the album finer than anyone: two 2 KiB
+            // windows placed by R0 and R1, four 1 KiB windows by
+            // R2-R5 — and one mode bit swaps the halves wholesale.
+            4 => {
+                let inverted = self.select & 0x80 != 0;
+                let a = if inverted { address ^ 0x1000 } else { address };
+                let bank = match a {
+                    0x0000..=0x07FF => (self.banks[0] & !1) as usize,
+                    0x0800..=0x0FFF => (self.banks[1] & !1) as usize,
+                    _ => self.banks[2 + (a - 0x1000) / 0x400] as usize,
+                };
+                if a < 0x1000 {
+                    bank * 1024 + (a & 0x07FF)
+                } else {
+                    bank * 1024 + (a & 0x03FF)
+                }
+            }
+
             _ => address,
         };
         self.chr_rom[index % self.chr_rom.len()]
@@ -237,10 +331,60 @@ impl Cartridge {
             };
         }
 
-        if self.vertical_mirroring {
+        if self.mapper == 4 {
+            if self.mmc3_horizontal {
+                Mirroring::Horizontal
+            } else {
+                Mirroring::Vertical
+            }
+        } else if self.vertical_mirroring {
             Mirroring::Vertical
         } else {
             Mirroring::Horizontal
+        }
+    }
+
+    /// The scanline counter, clocked by watching the beam's errands.
+    /// Address line 12 is low through the background's half of the
+    /// album and high through the sprites' — so with the common
+    /// arrangement, it rises once per scanline, at the sprite
+    /// fetches. Each clean rise steps the counter; reaching zero
+    /// with the IRQ armed pulls the line.
+    fn clock_a12(&self, address: u16) {
+        let high = address & 0x1000 != 0;
+        if !high {
+            self.a12_was_low.set(true);
+            return;
+        }
+        if !self.a12_was_low.get() {
+            return;
+        }
+        self.a12_was_low.set(false);
+
+        let count = self.irq_counter.get();
+        if count == 0 || self.irq_reload.get() {
+            self.irq_counter.set(self.irq_latch);
+            self.irq_reload.set(false);
+        } else {
+            self.irq_counter.set(count - 1);
+        }
+        if self.irq_counter.get() == 0 && self.irq_enabled {
+            self.irq_flag.set(true);
+        }
+    }
+
+    /// Whether this board is pulling the interrupt line right now.
+    pub fn irq_asserted(&self) -> bool {
+        self.irq_flag.get()
+    }
+
+    /// The wiretap's other ear: the address bus also moves when the
+    /// CPU talks to the picture chip's port — games clock the
+    /// counter by hand through $2006, and the board can't tell the
+    /// difference. Nor should we.
+    pub fn watch_address(&self, address: u16) {
+        if self.mapper == 4 {
+            self.clock_a12(address);
         }
     }
 }
@@ -380,5 +524,42 @@ mod tests {
         assert_eq!(cartridge.chr_ram.len(), 8 * 1024);
         cartridge.write_chr(0x0123, 0x77);
         assert_eq!(cartridge.read_chr(0x0123), 0x77);
+    }
+    #[test]
+    fn mmc3_places_quarters_and_bolts_the_back() {
+        let mut cartridge = switcher(4, 4); // eight 8 KiB quarters
+        cartridge.write_prg(0x8000, 6); // select R6
+        cartridge.write_prg(0x8001, 2); // R6 = quarter 2
+        assert_eq!(cartridge.read_prg(0x8000), 1); // quarter 2 = bank 1's front half
+        assert_eq!(cartridge.read_prg(0xE000), 3); // bolted last
+
+        cartridge.write_prg(0x8000, 0x46); // same, PRG mode flipped
+        assert_eq!(cartridge.read_prg(0xC000), 1); // R6 moved to the back
+        assert_eq!(cartridge.read_prg(0x8000), 3); // second-to-last up front
+    }
+
+    #[test]
+    fn the_counter_clocks_on_clean_rises() {
+        let mut cartridge = switcher(4, 2);
+        cartridge.write_prg(0xC000, 3); // latch
+        cartridge.write_prg(0xC001, 0); // reload on next rise
+        cartridge.write_prg(0xE001, 0); // armed
+
+        for _ in 0..3 {
+            cartridge.read_chr(0x0000); // low...
+            cartridge.read_chr(0x1000); // ...rise
+            assert!(!cartridge.irq_asserted());
+        }
+        cartridge.read_chr(0x0000);
+        cartridge.read_chr(0x1000); // the fourth rise: 3, 2, 1, zero
+        assert!(cartridge.irq_asserted());
+
+        // Staying high is one rise, not many.
+        cartridge.read_chr(0x1000);
+        cartridge.read_chr(0x1000);
+
+        // Disarming apologizes for the waiting IRQ.
+        cartridge.write_prg(0xE000, 0);
+        assert!(!cartridge.irq_asserted());
     }
 }

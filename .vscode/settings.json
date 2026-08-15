@@ -1,8 +1,10 @@
 {
     "cSpell.words": [
+        "CNROM",
         "nametable",
         "nametables",
         "nestest",
+        "NROM",
         "PPUADDR",
         "PPUCTRL",
         "PPUDATA",
@@ -12,6 +14,7 @@
         "scanline",
         "scanlines",
         "unwired",
+        "uxrom",
         "vblank"
     ]
 }

@@ -63,7 +63,15 @@ impl Bus {
             0x2000..=0x3FFF => match address & 0x0007 {
                 0x0002 => self.ppu.read_status(),
                 0x0004 => self.ppu.read_oam_data(),
-                0x0007 => self.ppu.read_data(&self.cartridge),
+                0x0007 => {
+                    self.cartridge.watch_address(self.ppu.data_address());
+                    let value = self.ppu.read_data(&self.cartridge);
+                    // The port stepped; the bus now shows the new
+                    // address, and its bit 12 counts too.
+                    self.cartridge.watch_address(self.ppu.data_address());
+                    value
+                }
+
                 _ => 0,
             },
 
@@ -97,17 +105,22 @@ impl Bus {
                 0x0003 => self.ppu.write_oam_address(value),
                 0x0004 => self.ppu.write_oam_data(value),
                 0x0005 => self.ppu.write_scroll(value),
-                0x0006 => self.ppu.write_address(value),
+                0x0006 => {
+                    self.ppu.write_address(value);
+                    self.cartridge.watch_address(self.ppu.data_address());
+                }
                 // Pattern space lives on the cartridge: a data-port
                 // write aimed below $2000 goes to the board (blank
                 // albums accept it), and the port still steps.
                 0x0007 => {
                     let address = self.ppu.data_address();
+                    self.cartridge.watch_address(address);
                     if address < 0x2000 {
                         self.cartridge.write_chr(address, value);
                         self.ppu.step_address();
                     } else {
                         self.ppu.write_data(value);
+                        self.cartridge.watch_address(self.ppu.data_address());
                     }
                 }
                 _ => {}

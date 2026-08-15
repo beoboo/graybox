@@ -655,7 +655,12 @@ impl Cpu {
             self.nmi_pending.set(false);
             self.nmi();
             self.advance_clock(7);
-        } else if self.bus.irq_line && self.status & FLAG_INTERRUPT_DISABLE == 0 {
+        } else if
+        // The line is shared: any device may pull it, and the
+        // cartridge just became a device.
+        (self.bus.irq_line || self.bus.cartridge.irq_asserted())
+            && self.status & FLAG_INTERRUPT_DISABLE == 0
+        {
             self.irq();
             self.advance_clock(7);
         }
@@ -1236,6 +1241,15 @@ mod tests {
             chr0: 0,
             chr1: 0,
             prg: 0,
+            select: 0,
+            banks: [0; 8],
+            mmc3_horizontal: false,
+            irq_latch: 0,
+            irq_counter: Cell::new(0),
+            irq_reload: Cell::new(false),
+            irq_enabled: false,
+            irq_flag: Cell::new(false),
+            a12_was_low: Cell::new(true),
         }
     }
 
