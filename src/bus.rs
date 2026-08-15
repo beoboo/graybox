@@ -75,6 +75,9 @@ impl Bus {
                 _ => 0,
             },
 
+            // The sound chip's one readable register.
+            0x4015 => self.apu.read_status(),
+
             // The first controller: one button per read.
             0x4016 => self.controller.read(),
 

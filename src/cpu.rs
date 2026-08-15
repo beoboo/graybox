@@ -210,6 +210,13 @@ impl Cpu {
         // where its program begins. The CPU's first act is to read it.
         self.pc = self.read_word(0xFFFC);
 
+        // Power-up manners: by the time the first instruction runs,
+        // the sound chip's conductor has already been counting for
+        // about ten cycles — eight, on the alignment our clock keeps.
+        for _ in 0..8 {
+            self.bus.apu.tick();
+        }
+
         // The reset sequence itself takes seven cycles before the
         // first instruction runs. The odometer starts there.
         self.cycles = 7;
@@ -647,20 +654,21 @@ impl Cpu {
             self.cycles += 1;
         }
 
-        // Settle the final cycle and any surcharges, then answer the
-        // taps: the NMI first — unless a $2002 read just snatched it
-        // away — and the IRQ line only when the I flag allows.
-        self.advance_clock((self.cycles - before) - prepaid);
+        // The 6502 polls its interrupt lines BEFORE an instruction's
+        // final cycle — a line that rises on the last cycle itself
+        // waits out one more instruction. Settle up to the
+        // penultimate cycle, ask every line at once — the clock's,
+        // the cartridge's, the conductor's — then spend the last.
+        self.advance_clock((self.cycles - before) - prepaid - 1);
+        let irq_polled =
+            (self.bus.irq_line || self.bus.cartridge.irq_asserted() || self.bus.apu.irq_pending())
+                && self.status & FLAG_INTERRUPT_DISABLE == 0;
+        self.advance_clock(1);
         if self.nmi_pending.get() {
             self.nmi_pending.set(false);
             self.nmi();
             self.advance_clock(7);
-        } else if
-        // The line is shared: any device may pull it, and the
-        // cartridge just became a device.
-        (self.bus.irq_line || self.bus.cartridge.irq_asserted())
-            && self.status & FLAG_INTERRUPT_DISABLE == 0
-        {
+        } else if irq_polled {
             self.irq();
             self.advance_clock(7);
         }
@@ -676,7 +684,12 @@ impl Cpu {
     /// crossings move the vblank flag and request the NMI on their
     /// exact dots, no matter which instruction was running.
     fn advance_clock(&mut self, cycles: u64) {
-        for _ in 0..cycles * 3 {
+        // The sound chip lives on this clock too: one tick per CPU
+        // cycle, ahead of the three dots that cycle contains.
+        for dot in 0..cycles * 3 {
+            if dot % 3 == 0 {
+                self.bus.apu.tick();
+            }
             self.bus.clock.tick();
 
             // The odd-frame skip: with rendering on, every other
