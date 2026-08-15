@@ -24,6 +24,7 @@ pub fn decode_tile(chr: &[u8], tile: usize) -> [[u8; 8]; 8] {
     pixels
 }
 
+use crate::cartridge::{Cartridge, Mirroring};
 use std::cell::Cell;
 
 /// The picture chip's own state: its private memory and the handful of
@@ -112,9 +113,10 @@ pub struct Ppu {
     /// their pixels already decoded and flipped.
     line_sprites: Vec<LineSprite>,
 
-    /// How this cartridge's board arranges the four nametable names
-    /// over the two real rooms of VRAM.
-    vertical_mirroring: bool,
+    /// How the board is arranging the four nametable names over the
+    /// two real rooms of VRAM — refreshed by the bus whenever the
+    /// board might have changed its mind.
+    mirroring: Mirroring,
 }
 
 /// One sprite as the beam meets it: a single row of eight decoded
@@ -155,8 +157,18 @@ impl Ppu {
             sprite_overflow: false,
             oam_addr: 0,
             line_sprites: Vec::new(),
-            vertical_mirroring,
+            mirroring: if vertical_mirroring {
+                Mirroring::Vertical
+            } else {
+                Mirroring::Horizontal
+            },
         }
+    }
+
+    /// The bus calls this after anything that might have moved the
+    /// board's wiring — for header boards it never changes.
+    pub fn set_mirroring(&mut self, mirroring: Mirroring) {
+        self.mirroring = mirroring;
     }
 
     /// Fold a nametable address ($2000-$2FFF and its echo) onto the two
@@ -166,10 +178,11 @@ impl Ppu {
     fn mirror(&self, address: u16) -> usize {
         let index = address as usize & 0x0FFF; // within the 4 KiB window
         let name = index / 0x400; // which of the four names, 0..=3
-        let room = if self.vertical_mirroring {
-            name & 1
-        } else {
-            name / 2
+        let room = match self.mirroring {
+            Mirroring::Vertical => name & 1,
+            Mirroring::Horizontal => name / 2,
+            Mirroring::SingleLow => 0,
+            Mirroring::SingleHigh => 1,
         };
         room * 0x400 + (index & 0x3FF)
     }
@@ -254,9 +267,16 @@ impl Ppu {
         self.step_address();
     }
 
+    /// Where the data port will land next — the bus asks before
+    /// routing a $2007 access, because pattern space belongs to the
+    /// cartridge, not to this chip.
+    pub fn data_address(&self) -> u16 {
+        self.v.get() & 0x3FFF
+    }
+
     /// The auto-step every PPUDATA access ends with: +1 normally, +32 —
     /// one screen-row down — when PPUCTRL asks for column order.
-    fn step_address(&self) {
+    pub fn step_address(&self) {
         let step = if self.ctrl & 0b0000_0100 != 0 { 32 } else { 1 };
         self.v.set(self.v.get().wrapping_add(step));
     }
@@ -279,15 +299,24 @@ impl Ppu {
     /// part is that reading walks the address forward exactly like
     /// writing, and games lean on that to step past addresses without
     /// disturbing them.
-    pub fn read_data(&self, chr: &[u8]) -> u8 {
+    pub fn read_data(&self, cart: &Cartridge) -> u8 {
         let address = self.v.get() & 0x3FFF;
+        // The crayon box is the one tenant with no waiting room: a
+        // palette read answers at once — while the buffer quietly
+        // loads the nametable byte that lives UNDER the palette's
+        // addresses, which is what the next ordinary read will get.
+        if address >= 0x3F00 {
+            let value = self.palette_ram[Self::palette_index(address)];
+            self.read_buffer.set(self.vram[self.mirror(address)]);
+            self.step_address();
+            return value;
+        }
         let value = self.read_buffer.get();
 
         self.read_buffer.set(match address {
-            // Pattern tables: the cartridge's art, readable through
-            // the port like everything else — and some games keep
-            // level data on those chips and read it back this way.
-            0x0000..=0x1FFF => chr[address as usize],
+            // Pattern tables: the cartridge's art, served by the
+            // board — banked, blank, or plain.
+            0x0000..=0x1FFF => cart.read_chr(address),
             0x2000..=0x3EFF => self.vram[self.mirror(address)],
             _ => self.palette_ram[Self::palette_index(address)],
         });
@@ -307,7 +336,7 @@ impl Ppu {
     /// `v` points at, its palette pick, and the pattern row `v`'s
     /// fine Y selects — the beam no longer knows where it is; it
     /// knows what `v` says.
-    fn fetch_tile(&mut self, chr: &[u8]) {
+    fn fetch_tile(&mut self, cart: &Cartridge) {
         let v = self.v.get();
 
         // `v`'s low twelve bits — coarse X, coarse Y, nametable —
@@ -336,8 +365,8 @@ impl Ppu {
             0
         };
         let start = table + tile * 16 + ((v >> 12) & 0b111) as usize;
-        self.next_pattern_low = chr[start];
-        self.next_pattern_high = chr[start + 8];
+        self.next_pattern_low = cart.read_chr(start as u16);
+        self.next_pattern_high = cart.read_chr(start as u16 + 8);
     }
 
     /// One tile to the right — and off the edge of a nametable means
@@ -392,7 +421,7 @@ impl Ppu {
     /// keep the first eight whose rows cross the line, and decode
     /// each one's row of pixels on the spot. Sprite zero is whoever
     /// sits in slot zero — the flag's namesake.
-    fn evaluate_sprites(&mut self, line: usize, chr: &[u8]) {
+    fn evaluate_sprites(&mut self, line: usize, cart: &Cartridge) {
         self.line_sprites.clear();
         let height = if self.ctrl & 0b0010_0000 != 0 { 16 } else { 8 };
 
@@ -414,7 +443,7 @@ impl Ppu {
                         self.oam[n * 4 + 2],
                         row,
                         height,
-                        chr,
+                        cart,
                     ),
                     attributes: self.oam[n * 4 + 2],
                     is_zero: n == 0,
@@ -434,7 +463,7 @@ impl Ppu {
         attributes: u8,
         mut row: usize,
         height: usize,
-        chr: &[u8],
+        cart: &Cartridge,
     ) -> [u8; 8] {
         // Flip V reads the sprite bottom-up: row 0 becomes the last.
         if attributes & 0b1000_0000 != 0 {
@@ -457,7 +486,12 @@ impl Ppu {
         // Chapter 13's decoder hands the whole tile back; keep one
         // row of it — and flip H is nothing more than reversing
         // that row.
-        let mut pixels = decode_tile(chr, half + tile)[row % 8];
+        // The board serves the bytes now, so gather the tile first.
+        let mut tile_bytes = [0u8; 16];
+        for (i, byte) in tile_bytes.iter_mut().enumerate() {
+            *byte = cart.read_chr(((half + tile) * 16 + i) as u16);
+        }
+        let mut pixels = decode_tile(&tile_bytes, 0)[row % 8];
         if attributes & 0b0100_0000 != 0 {
             pixels.reverse();
         }
@@ -612,7 +646,7 @@ impl Ppu {
     /// the belt; the belt advances and the pockets refill on the
     /// schedule the beam sets; the tail of every line — warm-up lap
     /// included — primes the first two tiles of the line below.
-    pub fn tick(&mut self, scanline: u16, dot: u16, chr: &[u8]) {
+    pub fn tick(&mut self, scanline: u16, dot: u16, cart: &Cartridge) {
         let (scanline, dot) = (scanline as usize, dot as usize);
         let drawing_line = scanline < 240;
 
@@ -641,7 +675,7 @@ impl Ppu {
             // and `v` has already wrapped into the neighbor to serve
             // them.
             if dot % 8 == 0 && dot <= 248 {
-                self.fetch_tile(chr);
+                self.fetch_tile(cart);
                 self.reload_shifts();
                 self.increment_x();
             }
@@ -667,14 +701,14 @@ impl Ppu {
         // Nobody casts for line zero — a real NES shows no sprites
         // on its first line, and now neither do we.
         if drawing_line && dot == 257 {
-            self.evaluate_sprites(scanline + 1, chr);
+            self.evaluate_sprites(scanline + 1, cart);
         }
 
         if (321..=336).contains(&dot) {
             self.shift();
 
             if dot == 328 || dot == 336 {
-                self.fetch_tile(chr);
+                self.fetch_tile(cart);
                 self.reload_shifts();
                 self.increment_x();
             }
@@ -949,7 +983,7 @@ mod tests {
         ppu.write_address(0x3F);
         ppu.write_address(0x00);
         ppu.write_data(0x11); // lands at $3F00
-        ppu.read_data(&[]); // a footstep past $3F01, touching nothing
+        ppu.read_data(&test_chr()); // a footstep past $3F01, touching nothing
         ppu.write_data(0x33); // must land at $3F02
         assert_eq!(ppu.palette_ram[0], 0x11);
         assert_eq!(ppu.palette_ram[1], 0x00); // undisturbed
@@ -965,8 +999,8 @@ mod tests {
 
         ppu.write_address(0x20);
         ppu.write_address(0x00);
-        assert_eq!(ppu.read_data(&[]), 0x00); // the stale waiting room
-        assert_eq!(ppu.read_data(&[]), 0x55); // yesterday's byte, today
+        assert_eq!(ppu.read_data(&test_chr()), 0x00); // the stale waiting room
+        assert_eq!(ppu.read_data(&test_chr()), 0x55); // yesterday's byte, today
     }
 
     #[test]
@@ -984,17 +1018,31 @@ mod tests {
 
     /// A cartridge's worth of art for the belt tests: tile 0 blank,
     /// tile 1 solid pattern-value 3.
-    fn test_chr() -> Vec<u8> {
+    fn test_chr() -> Cartridge {
         let mut chr = vec![0; 8192];
         for byte in &mut chr[16..32] {
             *byte = 0xFF;
         }
-        chr
+        Cartridge {
+            prg_rom: vec![0; 16 * 1024],
+            chr_rom: chr,
+            mapper: 0,
+            vertical_mirroring: false,
+            chr_ram: Vec::new(),
+            prg_ram: vec![0; 8 * 1024],
+            prg_bank: 0,
+            chr_bank: 0,
+            shift: 0b1_0000,
+            control: 0x0C,
+            chr0: 0,
+            chr1: 0,
+            prg: 0,
+        }
     }
 
     /// Walk the belt through the warm-up lap's priming and into a
     /// scanline, so the frame's first pixels arrive the way real ones do.
-    fn prime_and_draw(ppu: &mut Ppu, chr: &[u8], dots: usize) {
+    fn prime_and_draw(ppu: &mut Ppu, chr: &Cartridge, dots: usize) {
         for dot in 321..=336 {
             ppu.tick(261, dot, chr);
         }
@@ -1150,7 +1198,7 @@ mod tests {
 
     /// Draw one full line the honest way: prime on the warm-up lap,
     /// walk line 0 (which casts and primes line 1), then line 1.
-    fn draw_line_one(ppu: &mut Ppu, chr: &[u8]) {
+    fn draw_line_one(ppu: &mut Ppu, chr: &Cartridge) {
         for dot in 321..=336 {
             ppu.tick(261, dot, chr);
         }
@@ -1167,10 +1215,10 @@ mod tests {
         // Zooming Secretary walked left in two pieces: her tiles
         // swapped positions but nobody read bit 6, so each half
         // faced the wrong way. This pins the mirror forever.
-        let mut chr = vec![0; 8192];
+        let mut chr = test_chr();
         for row in 0..8 {
-            chr[16 + row] = 0xF0; // tile 1: left half lit...
-            chr[24 + row] = 0xF0; // ...in both planes: value 3
+            chr.chr_rom[16 + row] = 0xF0; // tile 1: left half lit...
+            chr.chr_rom[24 + row] = 0xF0; // ...in both planes: value 3
         }
         let mut ppu = Ppu::new(false);
         ppu.mask = 0b0001_1110;

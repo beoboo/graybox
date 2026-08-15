@@ -692,7 +692,7 @@ impl Cpu {
             self.bus.ppu.tick(
                 self.bus.clock.scanline,
                 self.bus.clock.dot,
-                &self.bus.cartridge.chr_rom,
+                &self.bus.cartridge,
             );
 
             if self.bus.clock.scanline == 241 && self.bus.clock.dot == 1 {
@@ -1226,6 +1226,16 @@ mod tests {
             chr_rom: vec![0; 8 * 1024],
             mapper: 0,
             vertical_mirroring: false,
+            // The board's furniture, at rest.
+            chr_ram: Vec::new(),
+            prg_ram: vec![0; 8 * 1024],
+            prg_bank: 0,
+            chr_bank: 0,
+            shift: 0b1_0000,
+            control: 0x0C,
+            chr0: 0,
+            chr1: 0,
+            prg: 0,
         }
     }
 

@@ -63,7 +63,7 @@ impl Bus {
             0x2000..=0x3FFF => match address & 0x0007 {
                 0x0002 => self.ppu.read_status(),
                 0x0004 => self.ppu.read_oam_data(),
-                0x0007 => self.ppu.read_data(&self.cartridge.chr_rom),
+                0x0007 => self.ppu.read_data(&self.cartridge),
                 _ => 0,
             },
 
@@ -73,8 +73,11 @@ impl Bus {
             // Sound registers, and the second controller port. Nobody.
             0x4000..=0x401F => 0,
 
-            // Cartridge territory that NROM boards leave unwired.
-            0x4020..=0x7FFF => 0,
+            // Cartridge territory the boards on our shelf leave unwired.
+            0x4020..=0x5FFF => 0,
+
+            // The pocket on the board.
+            0x6000..=0x7FFF => self.cartridge.prg_ram[address as usize - 0x6000],
 
             // The cartridge's program ROM.
             0x8000..=0xFFFF => self.cartridge.read_prg(address),
@@ -95,7 +98,18 @@ impl Bus {
                 0x0004 => self.ppu.write_oam_data(value),
                 0x0005 => self.ppu.write_scroll(value),
                 0x0006 => self.ppu.write_address(value),
-                0x0007 => self.ppu.write_data(value),
+                // Pattern space lives on the cartridge: a data-port
+                // write aimed below $2000 goes to the board (blank
+                // albums accept it), and the port still steps.
+                0x0007 => {
+                    let address = self.ppu.data_address();
+                    if address < 0x2000 {
+                        self.cartridge.write_chr(address, value);
+                        self.ppu.step_address();
+                    } else {
+                        self.ppu.write_data(value);
+                    }
+                }
                 _ => {}
             },
 
@@ -119,8 +133,18 @@ impl Bus {
             // the frame counter, falls through inside — Part II.)
             0x4000..=0x4017 => self.apu.write(address, value),
 
-            // Writes to ROM change nothing. The clue is in the name.
-            0x8000..=0xFFFF => {}
+            // The pocket accepts ink too.
+            0x6000..=0x7FFF => {
+                self.cartridge.prg_ram[address as usize - 0x6000] = value;
+            }
+
+            // A write into ROM territory reaches the board's latches
+            // — and the board may have rewired the name RAM by the
+            // time it's done, so the picture chip gets the news.
+            0x8000..=0xFFFF => {
+                self.cartridge.write_prg(address, value);
+                self.ppu.set_mirroring(self.cartridge.mirroring());
+            }
 
             // Everywhere else: nobody listening yet.
             _ => {}
