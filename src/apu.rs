@@ -381,6 +381,8 @@ pub struct Apu {
     pulse2: Pulse,
     triangle: Triangle,
     noise: Noise,
+    dmc: Dmc,
+    filter: OutputFilter,
     frame: FrameCounter,
 }
 
@@ -391,6 +393,8 @@ impl Apu {
             pulse2: Pulse::new(false),
             triangle: Triangle::new(),
             noise: Noise::new(),
+            dmc: Dmc::new(),
+            filter: OutputFilter::new(),
             frame: FrameCounter::new(),
         }
     }
@@ -414,11 +418,18 @@ impl Apu {
             0x400C => self.noise.write_control(value),
             0x400E => self.noise.write_mode(value),
             0x400F => self.noise.write_length(value),
+            0x4010 => self.dmc.write_control(value),
+            0x4011 => self.dmc.write_level(value),
+            0x4012 => self.dmc.write_address(value),
+            0x4013 => self.dmc.write_length(value),
             0x4015 => {
                 self.pulse1.length.set_enabled(value & 0b0001 != 0);
                 self.pulse2.length.set_enabled(value & 0b0010 != 0);
                 self.triangle.length.set_enabled(value & 0b0100 != 0);
                 self.noise.length.set_enabled(value & 0b1000 != 0);
+                self.dmc
+                    .set_enabled(value & 0b1_0000 != 0, self.frame.apu_cycle);
+                self.dmc.irq_pending.set(false);
             }
             0x4017 => {
                 if self.frame.write(value) {
@@ -434,6 +445,7 @@ impl Apu {
     /// counters follow, and every length counter closes the cycle
     /// knowing whether the next one carries its clock.
     pub fn tick(&mut self) {
+        self.dmc.tick();
         let (quarter, half) = self.frame.tick();
         if quarter {
             self.quarter_frame();
@@ -481,16 +493,34 @@ impl Apu {
         if self.noise.length.active() {
             status |= 0b1000;
         }
+        if self.dmc.bytes_remaining > 0 {
+            status |= 0b1_0000;
+        }
+        if self.dmc.irq_pending.get() {
+            status |= 0b1000_0000;
+        }
         if self.frame.take_irq() {
             status |= 0b0100_0000;
         }
         status
     }
 
-    /// Whether the conductor is pulling the CPU's interrupt line —
-    /// as the CPU sees it, one cycle behind the flag itself.
+    /// Whether the chip is pulling the CPU's interrupt line: the
+    /// conductor's flag or the sampler's — live, both of them. The
+    /// one-cycle lag the poll needs lives in the CPU now, where it
+    /// can serve every line at once.
     pub fn irq_pending(&self) -> bool {
-        self.frame.irq_line.get()
+        self.frame.irq_pending.get() || self.dmc.irq_pending.get()
+    }
+
+    /// The sampler's fetch request, passed through for the CPU.
+    pub fn dmc_fetch(&mut self) -> Option<u16> {
+        self.dmc.take_fetch()
+    }
+
+    /// The DMA's answer, passed back in.
+    pub fn dmc_supply(&mut self, value: u8) {
+        self.dmc.supply(value);
     }
 
     /// One sample of the chip's output: all four voices, mixed the
@@ -502,14 +532,16 @@ impl Apu {
         let triangle = self.triangle.sample(sample_rate);
         let noise = self.noise.sample(sample_rate);
 
-        mix(pulse1, pulse2, triangle, noise)
+        let mixed = mix(pulse1, pulse2, triangle, noise, self.dmc.level);
+        self.filter.process(mixed, sample_rate)
     }
 }
 
 /// The chip's two mixing curves, one per resistor ladder: the pulse
-/// pair on one, triangle-noise-sample on the other. Neither is a
-/// plain sum: loud voices crowd each other instead of clipping.
-fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8) -> f32 {
+/// pair on one, triangle-noise-sample on the other — the sample
+/// channel's name on that ladder finally cashed in. Neither curve
+/// is a plain sum: loud voices crowd each other instead of clipping.
+fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8, dmc: u8) -> f32 {
     let pulses = (pulse1 + pulse2) as f32;
     let pulse_out = if pulses == 0.0 {
         0.0
@@ -517,7 +549,7 @@ fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8) -> f32 {
         95.88 / (8128.0 / pulses + 100.0)
     };
 
-    let tnd = triangle as f32 / 8227.0 + noise as f32 / 12241.0;
+    let tnd = triangle as f32 / 8227.0 + noise as f32 / 12241.0 + dmc as f32 / 22638.0;
     let tnd_out = if tnd == 0.0 {
         0.0
     } else {
@@ -526,6 +558,55 @@ fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8) -> f32 {
 
     pulse_out + tnd_out
 }
+
+/// The console's last inch of wire: before the mixed signal reaches
+/// the speaker it crosses three little analogue stages — capacitors
+/// and resistors, not logic. Two high-passes (90 Hz and 440 Hz) pass
+/// CHANGE and block anything steady; one low-pass (14 kHz) rounds the
+/// harshest corners off the squares. This matters more than it looks:
+/// the mixer's silence is 0.0, not a midpoint, so an unfiltered note
+/// PARKS the speaker cone off-center — every start thumps, every DMC
+/// step clicks. The high-passes un-park it.
+struct OutputFilter {
+    hp90: (f32, f32),
+    hp440: (f32, f32),
+    lp14k: f32,
+}
+
+impl OutputFilter {
+    fn new() -> OutputFilter {
+        OutputFilter { hp90: (0.0, 0.0), hp440: (0.0, 0.0), lp14k: 0.0 }
+    }
+
+    fn process(&mut self, sample: f32, sample_rate: f32) -> f32 {
+        let sample = high_pass(&mut self.hp90, sample, 90.0, sample_rate);
+        let sample = high_pass(&mut self.hp440, sample, 440.0, sample_rate);
+        low_pass(&mut self.lp14k, sample, 14_000.0, sample_rate)
+    }
+}
+
+/// One resistor-capacitor stage, high-pass wiring: the output follows
+/// change in the input and decays toward zero when nothing changes.
+/// `state` is (previous input, previous output).
+fn high_pass(state: &mut (f32, f32), input: f32, cutoff: f32, sample_rate: f32) -> f32 {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    let dt = 1.0 / sample_rate;
+    let alpha = rc / (rc + dt);
+    let output = alpha * (state.1 + input - state.0);
+    *state = (input, output);
+    output
+}
+
+/// The same stage, wired the other way: the output chases the input
+/// but can only move so fast, which sands the edges off a square.
+fn low_pass(state: &mut f32, input: f32, cutoff: f32, sample_rate: f32) -> f32 {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    let dt = 1.0 / sample_rate;
+    let alpha = dt / (rc + dt);
+    *state += alpha * (input - *state);
+    *state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,9 +672,7 @@ mod tests {
         // now asks for constant volume, which is what "volume 15"
         // always secretly was.
         let mut pulse = singing(0b1001_1111, 253);
-        let loud = (0..44_100)
-            .filter(|_| pulse.sample(44_100.0) > 0)
-            .count();
+        let loud = (0..44_100).filter(|_| pulse.sample(44_100.0) > 0).count();
         let ratio = loud as f32 / 44_100.0;
         assert!((0.45..=0.55).contains(&ratio), "up {ratio} of the time");
     }
@@ -602,23 +681,25 @@ mod tests {
     fn the_mixer_squashes_instead_of_clipping() {
         // Both pulses at full blast: the mix stays shy of 0.26, the
         // resistor ladder's ceiling — not 2 x anything.
-        assert!(mix(15, 15, 0, 0) < 0.26);
-        assert!(mix(15, 15, 0, 0) < 2.0 * mix(15, 0, 0, 0));
-        assert_eq!(mix(0, 0, 0, 0), 0.0);
+        assert!(mix(15, 15, 0, 0, 0) < 0.26);
+        assert!(mix(15, 15, 0, 0, 0) < 2.0 * mix(15, 0, 0, 0, 0));
+        assert_eq!(mix(0, 0, 0, 0, 0), 0.0);
     }
 
     #[test]
     fn the_second_ladder_mixes_the_new_voices() {
         // The triangle alone registers louder than the noise alone at
         // equal levels — the resistor ratios say so — and both crowd
-        // rather than sum.
-        assert!(mix(0, 0, 15, 0) > mix(0, 0, 0, 15));
-        let both = mix(0, 0, 15, 15);
-        assert!(both < mix(0, 0, 15, 0) + mix(0, 0, 0, 15));
+        // rather than sum. The sampler rides the same ladder, at the
+        // quietest tap of the three.
+        assert!(mix(0, 0, 15, 0, 0) > mix(0, 0, 0, 15, 0));
+        assert!(mix(0, 0, 0, 15, 0) > mix(0, 0, 0, 0, 15));
+        let both = mix(0, 0, 15, 15, 0);
+        assert!(both < mix(0, 0, 15, 0, 0) + mix(0, 0, 0, 15, 0));
         assert!(both > 0.0);
     }
 
-        /// Tick the whole chip for a stretch of CPU cycles.
+    /// Tick the whole chip for a stretch of CPU cycles.
     fn run(apu: &mut Apu, cycles: u64) {
         for _ in 0..cycles {
             apu.tick();
@@ -812,6 +893,116 @@ mod tests {
         apu.write(0x4017, 0b1000_0000);
         assert_eq!(apu.pulse1.length.counter, 29, "no immediate clock");
     }
+    #[test]
+    fn the_sampler_asks_the_moment_its_buffer_is_empty() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 2); // sample at $C000 + 2 x 64
+        apu.write(0x4013, 1); // 17 bytes
+        apu.write(0x4015, 0b1_0000);
+
+        // The request surfaces a couple of cycles later — parity
+        // manners — and names the sample's first address.
+        assert_eq!(apu.dmc_fetch(), None, "asked before the delay ran out");
+        run(&mut apu, 3);
+        assert_eq!(apu.dmc_fetch(), Some(0xC080));
+    }
+
+    #[test]
+    fn each_bit_nudges_the_level_by_two() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0); // "zero" still means one byte
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+        apu.dmc_supply(0b1111_1111); // eight steps up
+
+        // The output unit must first shift out the eight silent bits
+        // it woke up with; only then does the byte load and nudge the
+        // level up 2 x 8 = 16 over the next eight periods.
+        run(&mut apu, 428 * 18);
+        assert_eq!(apu.dmc.level, 16);
+    }
+
+    #[test]
+    fn the_level_never_leaves_its_seven_bits() {
+        let mut apu = Apu::new();
+        apu.write(0x4011, 0x7E); // near the top
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0);
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+        apu.dmc_supply(0xFF); // eight more ups
+        run(&mut apu, 428 * 18);
+        assert!(apu.dmc.level <= 0x7F, "the DAC is seven bits wide");
+    }
+
+    #[test]
+    fn a_finished_sample_raises_the_irq_and_4015_reports_it() {
+        let mut apu = Apu::new();
+        apu.write(0x4010, 0b1000_0000); // IRQ on, no loop
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0); // one byte
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        let address = apu.dmc_fetch().unwrap();
+        apu.dmc_supply(0x00);
+        assert_eq!(address, 0xC000);
+        assert_ne!(apu.read_status() & 0b1000_0000, 0, "the sample ended");
+
+        // Writing $4015 clears the sampler's IRQ — that is the
+        // acknowledgement games use.
+        apu.write(0x4015, 0);
+        assert_eq!(apu.read_status() & 0b1000_0000, 0);
+    }
+
+    #[test]
+    fn a_byte_for_a_cancelled_sample_changes_nothing() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 1);
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+
+        // The game calls the sample off while the DMA is in flight.
+        apu.write(0x4015, 0);
+        apu.dmc_supply(0xAA);
+
+        // The late byte must not resurrect it: a $4015 read that
+        // says "still playing" here would say it forever.
+        assert_eq!(apu.read_status() & 0b1_0000, 0, "a ghost sample plays on");
+    }
+
+    #[test]
+    fn the_filter_unparks_the_speaker() {
+        // A steady level is exactly what the mixer emits mid-note.
+        // The high-passes must walk it back to zero — no parked cone,
+        // no thump.
+        let mut filter = OutputFilter::new();
+        let mut last = 1.0;
+        for _ in 0..44_100 {
+            last = filter.process(0.5, 44_100.0);
+        }
+        assert!(last.abs() < 0.001, "DC survived: {last}");
+    }
+
+    #[test]
+    fn the_filter_lets_the_music_through() {
+        // A 1 kHz wobble sits squarely between the corners and must
+        // keep most of its size.
+        let mut filter = OutputFilter::new();
+        let mut peak: f32 = 0.0;
+        for n in 0..44_100 {
+            let t = n as f32 / 44_100.0;
+            let out = filter.process((2.0 * std::f32::consts::PI * 1000.0 * t).sin(), 44_100.0);
+            if n > 22_050 {
+                peak = peak.max(out.abs());
+            }
+        }
+        assert!(peak > 0.8, "the tone was crushed to {peak}");
+    }
 }
 
 /// The 4-step conductor's beat, in CPU cycles from the sequence's
@@ -854,10 +1045,6 @@ struct FrameCounter {
     /// Which half of the divide-by-two the last CPU cycle fell on.
     /// Free-running: a $4017 write does not restart *this*.
     apu_cycle: bool,
-
-    /// The IRQ flag as it stood one cycle ago — what the CPU's poll
-    /// actually sees. The line takes a moment to cross the board.
-    irq_line: Cell<bool>,
 }
 
 impl FrameCounter {
@@ -869,7 +1056,6 @@ impl FrameCounter {
             irq_pending: Cell::new(false),
             pending_reset: None,
             apu_cycle: true,
-            irq_line: Cell::new(false),
         }
     }
 
@@ -883,8 +1069,6 @@ impl FrameCounter {
 
     /// Advance one CPU cycle. Returns (quarter, half): what to clock.
     fn tick(&mut self) -> (bool, bool) {
-        self.irq_line.set(self.irq_pending.get());
-
         if let Some(delay) = self.pending_reset {
             if delay == 0 {
                 self.pending_reset = None;
@@ -927,7 +1111,6 @@ impl FrameCounter {
         self.irq_inhibit = value & 0b0100_0000 != 0;
         if self.irq_inhibit {
             self.irq_pending.set(false);
-            self.irq_line.set(false);
         }
         self.pending_reset = Some(if self.apu_cycle { 3 } else { 4 });
         self.five_step
@@ -1137,4 +1320,214 @@ impl Noise {
             0
         }
     }
+}
+
+/// How many CPU cycles between bits of a sample, for each of the
+/// sixteen playback rates.
+const DMC_RATES: [u16; 16] = [
+    428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+];
+
+/// The fifth voice: the DMC, a sampler one bit at a time. Each bit
+/// nudges a 7-bit level up or down by two — sound as a diary of
+/// changes rather than of values.
+pub struct Dmc {
+    /// $4010 bit 7: raise an IRQ when the sample ends.
+    irq_enabled: bool,
+
+    /// $4010 bit 6: start the sample over instead of stopping.
+    loop_flag: bool,
+
+    /// The 7-bit level the channel presents to the mixer.
+    level: u8,
+
+    /// The one-byte buffer between the memory reader and the output
+    /// unit. Hardware really has exactly one byte here.
+    buffer: Option<u8>,
+
+    /// The output unit: eight bits shifting out of one byte.
+    shift: u8,
+    bits_remaining: u8,
+
+    /// Silent means the level holds still, not that it drops.
+    silence: bool,
+
+    /// Where the next sample byte lives, and how many remain.
+    current_address: u16,
+    bytes_remaining: u16,
+
+    /// $4012/$4013 raw values, kept to restart from.
+    sample_address: u8,
+    sample_length: u8,
+
+    /// CPU cycles between output bits, from DMC_RATES.
+    timer: u16,
+    timer_value: u16,
+
+    /// A byte the channel wants fetched. It cannot read memory
+    /// itself — the fetch is a DMA the CPU must perform.
+    pending_fetch: Option<u16>,
+
+    /// Cycles before a $4015-started fetch may surface: two or
+    /// three by write parity, so every start lands on one parity.
+    start_delay: u8,
+
+    /// Set when a sample ends with the IRQ enabled.
+    irq_pending: Cell<bool>,
+}
+
+impl Dmc {
+    fn new() -> Dmc {
+        Dmc {
+            irq_enabled: false,
+            loop_flag: false,
+            level: 0,
+            buffer: None,
+            shift: 0,
+            bits_remaining: 8,
+            silence: true,
+            current_address: 0,
+            bytes_remaining: 0,
+            sample_address: 0,
+            sample_length: 0,
+            timer: DMC_RATES[0],
+            timer_value: 1,
+            pending_fetch: None,
+            start_delay: 0,
+            irq_pending: Cell::new(false),
+        }
+    }
+
+    /// $4010 — rate, loop, and the IRQ switch. Switching the IRQ off
+    /// also drops one already raised.
+    fn write_control(&mut self, value: u8) {
+        self.irq_enabled = value & 0b1000_0000 != 0;
+        self.loop_flag = value & 0b0100_0000 != 0;
+        self.timer = DMC_RATES[(value & 0b1111) as usize];
+        if !self.irq_enabled {
+            self.irq_pending.set(false);
+        }
+    }
+
+    /// $4011 — write the level directly: PCM by hand.
+    fn write_level(&mut self, value: u8) {
+        self.level = value & 0b0111_1111;
+    }
+
+    /// $4012 — where the sample starts: $C000 plus 64-byte steps.
+    fn write_address(&mut self, value: u8) {
+        self.sample_address = value;
+    }
+
+    /// $4013 — how long it is: 16-byte steps, plus one.
+    fn write_length(&mut self, value: u8) {
+        self.sample_length = value;
+    }
+
+    /// Point the reader back at the sample's start.
+    fn restart(&mut self) {
+        self.current_address = 0xC000 | ((self.sample_address as u16) << 6);
+        self.bytes_remaining = ((self.sample_length as u16) << 4) | 1;
+    }
+    /// The $4015 bit: enabling starts the sample (unless one is
+    /// mid-flight); disabling stops it now. The parity decides the
+    /// start-up delay — see `start_delay`.
+    fn set_enabled(&mut self, enabled: bool, on_even_cycle: bool) {
+        if enabled {
+            if self.bytes_remaining == 0 {
+                self.restart();
+            }
+            if self.buffer.is_none() && self.bytes_remaining > 0 && self.pending_fetch.is_none() {
+                self.start_delay = if on_even_cycle { 3 } else { 2 };
+            }
+        } else {
+            self.bytes_remaining = 0;
+        }
+    }
+
+    /// One CPU cycle. The timer and output unit free-run from
+    /// power-on; $4015 gates only the memory reader.
+    fn tick(&mut self) {
+        if self.start_delay > 0 {
+            self.start_delay -= 1;
+        }
+
+        // The reader asks the moment the buffer is empty and bytes
+        // remain — independently of the output unit, which is what
+        // makes the buffer a buffer.
+        if self.start_delay == 0
+            && self.buffer.is_none()
+            && self.bytes_remaining > 0
+            && self.pending_fetch.is_none()
+        {
+            self.pending_fetch = Some(self.current_address);
+        }
+
+        if self.timer_value == 0 {
+            // One less than the period: acting at zero and reloading
+            // with the full value would stretch every rate by one.
+            self.timer_value = self.timer.saturating_sub(1);
+
+            if !self.silence {
+                if self.shift & 1 != 0 {
+                    if self.level <= 0x7D {
+                        self.level += 2;
+                    }
+                } else if self.level >= 0x02 {
+                    self.level -= 2;
+                }
+                self.shift >>= 1;
+            }
+
+            self.bits_remaining = self.bits_remaining.saturating_sub(1);
+            if self.bits_remaining == 0 {
+                self.bits_remaining = 8;
+                match self.buffer.take() {
+                    Some(byte) => {
+                        self.silence = false;
+                        self.shift = byte;
+                        // Ask for the refill in this same cycle: the
+                        // stall's length hangs on the halt's parity,
+                        // and the timer's even period keeps every
+                        // refill on one side of it.
+                        if self.bytes_remaining > 0 && self.pending_fetch.is_none() {
+                            self.pending_fetch = Some(self.current_address);
+                        }
+                    }
+                    None => self.silence = true,
+                }
+            }
+        } else {
+            self.timer_value -= 1;
+        }
+    }
+
+    /// The address the channel wants read, if any. Clears the ask.
+    fn take_fetch(&mut self) -> Option<u16> {
+        self.pending_fetch.take()
+    }
+
+    /// The DMA's answer. A byte for a sample that was called off in
+    /// the meantime changes nothing — there is no sample for it to
+    /// belong to.
+    fn supply(&mut self, value: u8) {
+        if self.bytes_remaining == 0 {
+            return;
+        }
+        self.buffer = Some(value);
+        self.current_address = if self.current_address == 0xFFFF {
+            0x8000
+        } else {
+            self.current_address + 1
+        };
+        self.bytes_remaining -= 1;
+        if self.bytes_remaining == 0 {
+            if self.loop_flag {
+                self.restart();
+            } else if self.irq_enabled {
+                self.irq_pending.set(true);
+            }
+        }
+    }
+
 }

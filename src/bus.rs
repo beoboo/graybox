@@ -5,9 +5,26 @@ use crate::cartridge::Cartridge;
 use crate::clock::Clock;
 use crate::controller::Controller;
 use crate::ppu::Ppu;
+use std::cell::Cell;
 
 /// Everything on the far side of the CPU's read and write lines.
 pub struct Bus {
+    /// Cycles a DMA stole from the CPU, waiting to be billed.
+    pub dma_stall: u64,
+
+    /// A $4014 write happened: the 513-or-514 bill is the CPU's to
+    /// compute, since only it knows the cycle parity.
+    pub oam_dma_started: bool,
+
+    /// The instruction cycle where a sampler fetch was billed full.
+    pub dmc_full_bill_at: Option<u64>,
+
+    /// The two halves of the controller-bit steal: the port was
+    /// read this instruction; a sampler fetch landed this
+    /// instruction. When both are true, one bit is gone.
+    pub read_4016_this_instruction: Cell<bool>,
+    pub dmc_fetched_this_instruction: Cell<bool>,
+
     /// The console's own RAM: two kibibytes. All of it. It was 1983.
     pub ram: [u8; 2048],
 
@@ -37,6 +54,11 @@ impl Bus {
     /// Wire a bus around a cartridge.
     pub fn new(cartridge: Cartridge) -> Bus {
         Bus {
+            dma_stall: 0,
+            oam_dma_started: false,
+            dmc_full_bill_at: None,
+            read_4016_this_instruction: Cell::new(false),
+            dmc_fetched_this_instruction: Cell::new(false),
             ram: [0; 2048],
             // Built before `cartridge` moves in, since it reads from it.
             ppu: Ppu::new(cartridge.vertical_mirroring),
@@ -78,8 +100,16 @@ impl Bus {
             // The sound chip's one readable register.
             0x4015 => self.apu.read_status(),
 
-            // The first controller: one button per read.
-            0x4016 => self.controller.read(),
+            0x4016 => {
+                // A sampler DMA that landed earlier in this very
+                // instruction re-clocked the port: the bit it read
+                // is gone before the program looks.
+                if self.dmc_fetched_this_instruction.get() {
+                    self.controller.read();
+                }
+                self.read_4016_this_instruction.set(true);
+                self.controller.read()
+            }
 
             // Sound registers, and the second controller port. Nobody.
             0x4000..=0x401F => 0,
@@ -139,6 +169,7 @@ impl Bus {
                     let byte = self.read(base + offset);
                     self.ppu.write_oam_data(byte);
                 }
+                self.oam_dma_started = true;
             }
 
             // The controller's strobe line.

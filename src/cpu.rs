@@ -45,6 +45,25 @@ pub struct Cpu {
     /// so the tap waits out one more instruction first.
     nmi_delay: Cell<bool>,
 
+    /// The IRQ line as the poll sees it: a delayed shadow, refreshed
+    /// by the same clock that moves the dots — no computed polling
+    /// cycle anywhere. Two stages deep: the line crosses the board,
+    /// then waits for the poll's own edge.
+    irq_shadow: bool,
+    irq_shadow_next: bool,
+
+    /// While a DMA has the bus, the shadow holds still: the decision
+    /// about the halted instruction was made before the halt began.
+    in_dma: bool,
+
+    /// CLI, SEI and PLP change the I flag on their FINAL cycle —
+    /// after the poll. The new bit waits here through one poll.
+    pending_i: Option<bool>,
+
+    /// CPU cycles ticked since this instruction began — how the DMA
+    /// billing knows where in the instruction a fetch landed.
+    instr_cycle: u64,
+
     /// The bus: everything the CPU can reach lives on its far side.
     pub bus: Bus,
 }
@@ -145,6 +164,11 @@ impl Cpu {
             crossed: false,
             nmi_pending: Cell::new(false),
             nmi_delay: Cell::new(false),
+            irq_shadow: false,
+            irq_shadow_next: false,
+            in_dma: false,
+            pending_i: None,
+            instr_cycle: 0,
             bus: Bus::new(cartridge),
         }
     }
@@ -325,6 +349,7 @@ impl Cpu {
         // the last ticks by BEFORE the work happens. On a 6502 the
         // data access rides the final cycle — so whatever this
         // instruction reads or writes does so on its true dot.
+        self.instr_cycle = 0;
         let prepaid = (CYCLES[opcode as usize] as u64).saturating_sub(1);
         self.advance_clock(prepaid);
 
@@ -422,9 +447,14 @@ impl Cpu {
             // only on pushed copies — PHP pushes them as ones, and PLP
             // politely ignores them.
             0x08 => self.push(self.status | 0b0011_0000),
+            // PLP restores the I flag as late as CLI writes it: the
+            // rest of the byte lands now, that one bit after the
+            // poll.
             0x28 => {
                 let value = self.pull();
-                self.status = (value | 0b0010_0000) & !0b0001_0000;
+                self.pending_i = Some(value & FLAG_INTERRUPT_DISABLE != 0);
+                self.status = (value | 0b0010_0000) & !0b0001_0000 & !FLAG_INTERRUPT_DISABLE
+                    | (self.status & FLAG_INTERRUPT_DISABLE);
             }
 
             // JSR — Jump to SubRoutine: leave a return note on the
@@ -581,8 +611,11 @@ impl Cpu {
             // letter: SEI/CLI for Interrupt-disable, SED/CLD for
             // Decimal (the flag the NES ignores), CLV for oVerflow —
             // which nothing sets directly.
-            0x78 => self.status |= FLAG_INTERRUPT_DISABLE,
-            0x58 => self.status &= !FLAG_INTERRUPT_DISABLE,
+            // SEI and CLI write the I flag on their final cycle —
+            // past the poll, so the change waits out one more
+            // instruction. The examiner for this is famous.
+            0x78 => self.pending_i = Some(true),
+            0x58 => self.pending_i = Some(false),
             0xF8 => self.status |= FLAG_DECIMAL,
             0xD8 => self.status &= !FLAG_DECIMAL,
             0xB8 => self.status &= !FLAG_OVERFLOW,
@@ -654,21 +687,67 @@ impl Cpu {
             self.cycles += 1;
         }
 
-        // The 6502 polls its interrupt lines BEFORE an instruction's
-        // final cycle — a line that rises on the last cycle itself
-        // waits out one more instruction. Settle up to the
-        // penultimate cycle, ask every line at once — the clock's,
-        // the cartridge's, the conductor's — then spend the last.
-        self.advance_clock((self.cycles - before) - prepaid - 1);
-        let irq_polled =
-            (self.bus.irq_line || self.bus.cartridge.irq_asserted() || self.bus.apu.irq_pending())
-                && self.status & FLAG_INTERRUPT_DISABLE == 0;
+        // Settle the instruction's remaining cycles. The shadow
+        // trails behind, which IS the hardware's poll position — no
+        // arithmetic required. One tick in, remember what it said:
+        // taken branches poll THERE.
         self.advance_clock(1);
+        let branch_shadow = self.irq_shadow;
+        self.advance_clock((self.cycles - before) - prepaid - 1);
+
+        // Then any cycles a DMA stole, with the shadow frozen: the
+        // decision about the halted instruction was made before the
+        // halt began.
+        let mut stall = self.bus.dma_stall;
+        self.bus.dma_stall = 0;
+        if self.bus.oam_dma_started {
+            self.bus.oam_dma_started = false;
+            stall += 512 + ((self.cycles & 1) ^ 1);
+            // A sampler fetch billed at full price on this very
+            // instruction's final prepaid cycle rides the halt after
+            // all: refund the difference.
+            if matches!(self.bus.dmc_full_bill_at, Some(at) if at >= prepaid) {
+                stall -= 2;
+            }
+        }
+        self.bus.dmc_full_bill_at = None;
+        self.bus.read_4016_this_instruction.set(false);
+        self.bus.dmc_fetched_this_instruction.set(false);
+        if stall > 0 {
+            self.cycles += stall;
+            self.in_dma = true;
+            self.advance_clock(stall);
+            self.in_dma = false;
+        }
+
+        // One more habit of the silicon: a TAKEN branch that stays
+        // on its page skips the poll before its final cycle — the
+        // decision falls back to the cycle before.
+        let spent = self.cycles - before;
+        let branchy = matches!(
+            opcode,
+            0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xB0 | 0xD0 | 0xF0
+        );
+        if branchy && spent == 3 {
+            self.irq_shadow = branch_shadow;
+        }
+
+        // The poll's decision stands; a deferred I-flag lands right
+        // after it — late enough to miss its own instruction's poll,
+        // early enough to be the status an interrupt pushes.
+        let take_irq = self.irq_shadow && self.status & FLAG_INTERRUPT_DISABLE == 0;
+        if let Some(on) = self.pending_i.take() {
+            if on {
+                self.status |= FLAG_INTERRUPT_DISABLE;
+            } else {
+                self.status &= !FLAG_INTERRUPT_DISABLE;
+            }
+        }
         if self.nmi_pending.get() {
             self.nmi_pending.set(false);
             self.nmi();
             self.advance_clock(7);
-        } else if irq_polled {
+        } else if take_irq {
             self.irq();
             self.advance_clock(7);
         }
@@ -688,7 +767,37 @@ impl Cpu {
         // cycle, ahead of the three dots that cycle contains.
         for dot in 0..cycles * 3 {
             if dot % 3 == 0 {
+                self.instr_cycle += 1;
+                // First, refresh the poll's delayed view of the IRQ
+                // line — with what the line said BEFORE this cycle.
+                if !self.in_dma {
+                    self.irq_shadow = self.irq_shadow_next;
+                    self.irq_shadow_next = self.bus.irq_line
+                        || self.bus.cartridge.irq_asserted()
+                        || self.bus.apu.irq_pending();
+                }
+
                 self.bus.apu.tick();
+                // The sampler cannot read memory itself: its fetch
+                // is a DMA. Serve it, and bill the stolen cycles.
+                if let Some(address) = self.bus.apu.dmc_fetch() {
+                    let value = self.bus.read(address);
+                    self.bus.apu.dmc_supply(value);
+                    if self.in_dma || self.bus.oam_dma_started {
+                        self.bus.dma_stall += 2;
+                    } else {
+                        self.bus.dma_stall += 4;
+                        self.bus.dmc_full_bill_at = Some(self.instr_cycle);
+                    }
+                    // And the port pays a stranger price: a fetch
+                    // sharing an instruction with a $4016 read
+                    // re-clocks the controller — one bit, stolen.
+                    if self.bus.read_4016_this_instruction.get() {
+                        self.bus.controller.read();
+                    } else {
+                        self.bus.dmc_fetched_this_instruction.set(true);
+                    }
+                }
             }
             self.bus.clock.tick();
 
@@ -1992,6 +2101,54 @@ mod tests {
         cpu.read(0x2002);
         assert!(!cpu.nmi_pending.get()); // the suppression race
     }
+    #[test]
+    fn sprite_dma_bills_five_hundred_and_some_cycles() {
+        // STA $4014 is four cycles of instruction — and then the
+        // machine stands still while 256 bytes march. The bill is
+        // 513 or 514, decided by the cycle parity of the start.
+        let mut cpu = Cpu::new(test_cartridge(&[0x8D, 0x14, 0x40]));
+        cpu.reset();
+        let before = cpu.cycles;
+        cpu.step();
+        let spent = cpu.cycles - before;
+        // Hardware quotes the halt as 513 or 514; in this machine's
+        // books one of those cycles is the store's own final cycle,
+        // so the bill reads 512 or 513 — the examiner ROM confirms
+        // the total on the wire is exact either way.
+        assert!(
+            spent == 4 + 512 || spent == 4 + 513,
+            "sprite DMA billed {spent} cycles"
+        );
+    }
+
+    #[test]
+    fn a_sample_fetch_steals_a_controller_bit() {
+        // The same three instructions, twice: press A, strobe, read.
+        // The only difference is whether the sample channel is
+        // fetching — and with it, whether the read sees the A press.
+        let read_a = |dmc: bool| {
+            let enable = if dmc { 0x10 } else { 0x00 };
+            let mut cpu = Cpu::new(test_cartridge(&[
+                0xA9, enable, // LDA — the sampler's enable bit, or not
+                0x8D, 0x15, 0x40, // STA $4015
+                0xAD, 0x16, 0x40, // LDA $4016 — the fetch lands here
+            ]));
+            cpu.reset();
+            cpu.bus.controller.buttons = 0b0000_0001; // A held down
+            cpu.bus.write(0x4016, 1);
+            cpu.bus.write(0x4016, 0);
+            cpu.step();
+            cpu.step();
+            cpu.step();
+            cpu.a & 1
+        };
+        assert_eq!(read_a(false), 1, "quiet machine: A reads as pressed");
+        assert_eq!(
+            read_a(true),
+            0,
+            "the fetch re-clocked the port and ate the A bit"
+        );
+    }
 
     #[test]
     fn the_irq_line_waits_for_permission() {
@@ -2002,12 +2159,16 @@ mod tests {
         cpu.step();
         assert_eq!(cpu.pc, 0x8001);
 
-        // CLI opens the door, and the tap lands at once.
-        let mut cpu = Cpu::new(test_cartridge(&[0x58]));
+        // CLI opens the door — one instruction late, as the silicon
+        // does: the I flag lands on CLI's final cycle, after the
+        // poll, so the very next instruction still runs.
+        let mut cpu = Cpu::new(test_cartridge(&[0x58, 0xEA]));
         cpu.reset();
         cpu.bus.irq_line = true;
         cpu.step();
-        assert_eq!(cpu.pc, 0x9000); // the IRQ's pad
+        assert_eq!(cpu.pc, 0x8001); // CLI done, tap NOT yet taken
+        cpu.step();
+        assert_eq!(cpu.pc, 0x9000); // the NOP ran; now the IRQ's pad
     }
 
     #[test]
