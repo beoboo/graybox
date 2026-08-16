@@ -120,25 +120,27 @@ pub enum AddressingMode {
 /// low. Three kinds of surcharge are billed separately: reads that
 /// cross a page, branches that jump, branches that jump FAR. A zero
 /// marks an opcode this CPU refuses.
+// Every zero is gone: the unofficial opcodes have prices too, and
+// only the twelve JAMs — which cost the rest of forever — keep it.
 #[rustfmt::skip]
 const CYCLES: [u8; 256] = [
     //  0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F
-        7, 6, 2, 0, 0, 3, 5, 0, 3, 2, 2, 0, 0, 4, 6, 0, // 0
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 1
-        6, 6, 0, 0, 3, 3, 5, 0, 4, 2, 2, 0, 4, 4, 6, 0, // 2
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 3
-        6, 6, 0, 0, 0, 3, 5, 0, 3, 2, 2, 0, 3, 4, 6, 0, // 4
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 5
-        6, 6, 0, 0, 0, 3, 5, 0, 4, 2, 2, 0, 5, 4, 6, 0, // 6
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // 7
-        0, 6, 0, 0, 3, 3, 3, 0, 2, 0, 2, 0, 4, 4, 4, 0, // 8
-        2, 6, 0, 0, 4, 4, 4, 0, 2, 5, 2, 0, 0, 5, 0, 0, // 9
-        2, 6, 2, 0, 3, 3, 3, 0, 2, 2, 2, 0, 4, 4, 4, 0, // A
-        2, 5, 0, 0, 4, 4, 4, 0, 2, 4, 2, 0, 4, 4, 4, 0, // B
-        2, 6, 0, 0, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0, // C
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // D
-        2, 6, 0, 0, 3, 3, 5, 0, 2, 2, 2, 0, 4, 4, 6, 0, // E
-        2, 5, 0, 0, 0, 4, 6, 0, 2, 4, 0, 0, 0, 4, 7, 0, // F
+        7, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6, // 0
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // 1
+        6, 6, 0, 8, 3, 3, 5, 5, 4, 2, 2, 2, 4, 4, 6, 6, // 2
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // 3
+        6, 6, 0, 8, 3, 3, 5, 5, 3, 2, 2, 2, 3, 4, 6, 6, // 4
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // 5
+        6, 6, 0, 8, 3, 3, 5, 5, 4, 2, 2, 2, 5, 4, 6, 6, // 6
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // 7
+        2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4, // 8
+        2, 6, 0, 6, 4, 4, 4, 4, 2, 5, 2, 5, 5, 5, 5, 5, // 9
+        2, 6, 2, 6, 3, 3, 3, 3, 2, 2, 2, 2, 4, 4, 4, 4, // A
+        2, 5, 0, 5, 4, 4, 4, 4, 2, 4, 2, 4, 4, 4, 4, 4, // B
+        2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6, // C
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // D
+        2, 6, 2, 8, 3, 3, 5, 5, 2, 2, 2, 2, 4, 4, 6, 6, // E
+        2, 5, 0, 8, 4, 4, 6, 6, 2, 4, 2, 7, 4, 4, 7, 7, // F
 ];
 
 /// Do two addresses sit on different pages? A "page" is a 256-byte
@@ -289,6 +291,11 @@ impl Cpu {
                 self.pc = self.pc.wrapping_add(2);
                 let address = base.wrapping_add(self.x as u16);
                 self.crossed = crosses_a_page(base, address);
+                // The crossing's extra cycle is a real READ, at the
+                // not-yet-fixed address: old page, new low byte.
+                if self.crossed {
+                    self.read((base & 0xFF00) | (address & 0x00FF));
+                }
                 address
             }
             // The same, with Y.
@@ -297,6 +304,11 @@ impl Cpu {
                 self.pc = self.pc.wrapping_add(2);
                 let address = base.wrapping_add(self.y as u16);
                 self.crossed = crosses_a_page(base, address);
+                // The crossing's extra cycle is a real READ, at the
+                // not-yet-fixed address: old page, new low byte.
+                if self.crossed {
+                    self.read((base & 0xFF00) | (address & 0x00FF));
+                }
                 address
             }
             // ($xx,X): add X to the zero-page spot, THEN follow the
@@ -323,6 +335,9 @@ impl Cpu {
                 let pointer = (high << 8) | low;
                 let address = pointer.wrapping_add(self.y as u16);
                 self.crossed = crosses_a_page(pointer, address);
+                if self.crossed {
+                    self.read((pointer & 0xFF00) | (address & 0x00FF));
+                }
                 address
             }
         }
@@ -339,6 +354,12 @@ impl Cpu {
         // and move the program counter past it.
         let opcode = self.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
+        // Every one-byte instruction still fetches the byte AFTER
+        // its opcode and throws it away — a read with real side
+        // effects when PC walks through register space.
+        if let Some((_, 1)) = Cpu::opcode_name_and_length(opcode) {
+            self.read(self.pc);
+        }
 
         // Pay the base fare off the price list before doing the work.
         // Surcharges, where they apply, get added along the way.
@@ -675,7 +696,275 @@ impl Cpu {
             // JAM — an unofficial opcode that genuinely freezes a real
             // 6502 until the reset button. Ours stops politely instead,
             // and the test programs end on it.
-            0x02 => return false,
+            // Eleven brothers jam identically.
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
+                return false;
+            }
+            // ---- The unofficial army ----
+            // NOPs of every shape: they do nothing, but they do it
+            // with real reads at real addresses, surcharges included.
+            0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => {}
+            0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 => {
+                self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+            }
+            0x04 | 0x44 | 0x64 => {
+                let address = self.operand_address(AddressingMode::ZeroPage);
+                self.read(address);
+            }
+            0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 => {
+                let address = self.operand_address(AddressingMode::ZeroPageX);
+                self.read(address);
+            }
+            0x0C => {
+                let address = self.operand_address(AddressingMode::Absolute);
+                self.read(address);
+            }
+            0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => {
+                let address = self.operand_address(AddressingMode::AbsoluteX);
+                self.read(address);
+            }
+
+            // LAX, SAX, and SBC's unofficial twin.
+            0xA7 => self.lax(AddressingMode::ZeroPage),
+            0xB7 => self.lax(AddressingMode::ZeroPageY),
+            0xAF => self.lax(AddressingMode::Absolute),
+            0xBF => self.lax(AddressingMode::AbsoluteY),
+            0xA3 => self.lax(AddressingMode::IndirectX),
+            0xB3 => self.lax(AddressingMode::IndirectY),
+            0x87 => self.sax(AddressingMode::ZeroPage),
+            0x97 => self.sax(AddressingMode::ZeroPageY),
+            0x8F => self.sax(AddressingMode::Absolute),
+            0x83 => self.sax(AddressingMode::IndirectX),
+            0xEB => self.sbc(AddressingMode::Immediate),
+
+            // The fused rewrites: DCP, ISB, SLO, RLA, SRE, RRA —
+            // each an official rewrite plus an official A-operation,
+            // sharing one opcode by decoding accident.
+            0xC7 => self.modify_then(AddressingMode::ZeroPage, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xD7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xCF => self.modify_then(AddressingMode::Absolute, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xDF => self.modify_then(AddressingMode::AbsoluteX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xDB => self.modify_then(AddressingMode::AbsoluteY, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xC3 => self.modify_then(AddressingMode::IndirectX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xD3 => self.modify_then(AddressingMode::IndirectY, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xE7 => self.modify_then(AddressingMode::ZeroPage, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xF7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xEF => self.modify_then(AddressingMode::Absolute, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xFF => self.modify_then(AddressingMode::AbsoluteX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xFB => self.modify_then(AddressingMode::AbsoluteY, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xE3 => self.modify_then(AddressingMode::IndirectX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xF3 => self.modify_then(AddressingMode::IndirectY, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0x07 => self.modify_then(AddressingMode::ZeroPage, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x17 => self.modify_then(AddressingMode::ZeroPageX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x0F => self.modify_then(AddressingMode::Absolute, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x1F => self.modify_then(AddressingMode::AbsoluteX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x1B => self.modify_then(AddressingMode::AbsoluteY, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x03 => self.modify_then(AddressingMode::IndirectX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x13 => self.modify_then(AddressingMode::IndirectY, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x27 => self.modify_then(AddressingMode::ZeroPage, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x37 => self.modify_then(AddressingMode::ZeroPageX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x2F => self.modify_then(AddressingMode::Absolute, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x3F => self.modify_then(AddressingMode::AbsoluteX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x3B => self.modify_then(AddressingMode::AbsoluteY, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x23 => self.modify_then(AddressingMode::IndirectX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x33 => self.modify_then(AddressingMode::IndirectY, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x47 => self.modify_then(AddressingMode::ZeroPage, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x57 => self.modify_then(AddressingMode::ZeroPageX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x4F => self.modify_then(AddressingMode::Absolute, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x5F => self.modify_then(AddressingMode::AbsoluteX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x5B => self.modify_then(AddressingMode::AbsoluteY, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x43 => self.modify_then(AddressingMode::IndirectX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x53 => self.modify_then(AddressingMode::IndirectY, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x67 => self.modify_then(AddressingMode::ZeroPage, Cpu::ror_value, Cpu::add_to_a),
+            0x77 => self.modify_then(AddressingMode::ZeroPageX, Cpu::ror_value, Cpu::add_to_a),
+            0x6F => self.modify_then(AddressingMode::Absolute, Cpu::ror_value, Cpu::add_to_a),
+            0x7F => self.modify_then(AddressingMode::AbsoluteX, Cpu::ror_value, Cpu::add_to_a),
+            0x7B => self.modify_then(AddressingMode::AbsoluteY, Cpu::ror_value, Cpu::add_to_a),
+            0x63 => self.modify_then(AddressingMode::IndirectX, Cpu::ror_value, Cpu::add_to_a),
+            0x73 => self.modify_then(AddressingMode::IndirectY, Cpu::ror_value, Cpu::add_to_a),
+
+            // The immediates with strong opinions.
+            0x0B | 0x2B => {
+                // ANC: AND, then Carry copies the sign bit.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                self.a &= value;
+                self.update_zero_and_negative(self.a);
+                if self.a & 0x80 != 0 {
+                    self.status |= FLAG_CARRY;
+                } else {
+                    self.status &= !FLAG_CARRY;
+                }
+            }
+            0x4B => {
+                // ALR: AND, then shift A right.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                self.a &= value;
+                self.a = self.lsr_value(self.a);
+            }
+            0x6B => {
+                // ARR: AND, rotate A right — but the flags come from
+                // the adder's leftovers: Carry is bit 6, Overflow is
+                // bit 6 against bit 5.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                let carry_in = if self.status & FLAG_CARRY != 0 {
+                    0x80
+                } else {
+                    0
+                };
+                let result = ((self.a & value) >> 1) | carry_in;
+                self.a = result;
+                self.update_zero_and_negative(result);
+                if result & 0x40 != 0 {
+                    self.status |= FLAG_CARRY;
+                } else {
+                    self.status &= !FLAG_CARRY;
+                }
+                if ((result >> 6) ^ (result >> 5)) & 1 != 0 {
+                    self.status |= FLAG_OVERFLOW;
+                } else {
+                    self.status &= !FLAG_OVERFLOW;
+                }
+            }
+            0xCB => {
+                // AXS: X becomes (A AND X) minus the operand, with
+                // CMP's flag manners.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                let base = self.a & self.x;
+                self.compare_value(base, value);
+                self.x = base.wrapping_sub(value);
+            }
+            0x8B => {
+                // XAA: X AND the operand into A — the approximation
+                // every emulator settles on for a genuinely unstable
+                // opcode.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                self.a = self.x & value;
+                self.update_zero_and_negative(self.a);
+            }
+            0xAB => {
+                // LAX immediate, the unstable one: A and X both take
+                // the operand.
+                let value = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                self.a = value;
+                self.x = value;
+                self.update_zero_and_negative(value);
+            }
+            0xBB => {
+                // LAS: memory AND the stack pointer, into A, X and SP.
+                let address = self.operand_address(AddressingMode::AbsoluteY);
+                let value = self.read(address) & self.sp;
+                self.a = value;
+                self.x = value;
+                self.sp = value;
+                self.update_zero_and_negative(value);
+            }
+            0x9F => self.strange_store(AddressingMode::AbsoluteY, self.a & self.x),
+            0x93 => self.strange_store(AddressingMode::IndirectY, self.a & self.x),
+            0x9E => self.strange_store(AddressingMode::AbsoluteY, self.x),
+            0x9C => self.strange_store(AddressingMode::AbsoluteX, self.y),
+            0x9B => {
+                // TAS: SP takes A AND X, then the strange store.
+                self.sp = self.a & self.x;
+                self.strange_store(AddressingMode::AbsoluteY, self.a & self.x);
+            }
 
             // An opcode we don't implement. Stopping loudly beats
             // carrying on wrongly.
@@ -910,6 +1199,18 @@ impl Cpu {
     fn compare(&mut self, mode: AddressingMode, register: u8) {
         let address = self.operand_address(mode);
         let value = self.read(address);
+        self.compare_value(register, value);
+    }
+
+    /// The comparison itself, for callers that already hold the
+    /// value — the unofficial army knocks here.
+    fn compare_value(&mut self, register: u8, value: u8) {
+        if register >= value {
+            self.status |= FLAG_CARRY;
+        } else {
+            self.status &= !FLAG_CARRY;
+        }
+        self.update_zero_and_negative(register.wrapping_sub(value));
 
         if register >= value {
             self.status |= FLAG_CARRY;
@@ -1000,13 +1301,105 @@ impl Cpu {
     /// name is a value you can pass around, like any other.
     fn modify(&mut self, mode: AddressingMode, worker: fn(&mut Cpu, u8) -> u8) {
         let address = self.operand_address(mode);
+        // An indexed rewrite reads its target twice — once at the
+        // possibly-unfixed address, once fixed. If the crossing
+        // already paid that first read, don't pay it again.
+        let indexed = matches!(
+            mode,
+            AddressingMode::AbsoluteX | AddressingMode::AbsoluteY | AddressingMode::IndirectY
+        );
+        if indexed && !self.crossed {
+            self.read(address);
+        }
 
         // Read-modify-write pays the worst case up front, like STA.
         self.crossed = false;
 
         let value = self.read(address);
+
+        // The double write: hardware puts the UNMODIFIED byte back
+        // while the arithmetic happens, then the result. Plain RAM
+        // never notices; registers with side effects do.
+        self.write(address, value);
         let result = worker(self, value);
         self.write(address, result);
+    }
+    /// The unofficial army's common shape: a rewrite and an
+    /// A-operation fused into one opcode — two circuits answering
+    /// one decode by accident, both doing their jobs.
+    fn modify_then(
+        &mut self,
+        mode: AddressingMode,
+        worker: fn(&mut Cpu, u8) -> u8,
+        then: fn(&mut Cpu, u8),
+    ) {
+        let address = self.operand_address(mode);
+        let indexed = matches!(
+            mode,
+            AddressingMode::AbsoluteX | AddressingMode::AbsoluteY | AddressingMode::IndirectY
+        );
+        if indexed && !self.crossed {
+            self.read(address);
+        }
+        self.crossed = false;
+        let value = self.read(address);
+        self.write(address, value);
+        let result = worker(self, value);
+        self.write(address, result);
+        then(self, result);
+    }
+
+    /// LAX — LDA and LDX in one breath.
+    fn lax(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        let value = self.read(address);
+        self.a = value;
+        self.x = value;
+        self.update_zero_and_negative(value);
+    }
+
+    /// SAX — store A AND X. No flags; the AND is free wiring.
+    fn sax(&mut self, mode: AddressingMode) {
+        let address = self.operand_address(mode);
+        self.crossed = false;
+        self.write(address, self.a & self.x);
+    }
+
+    /// The unstable stores: the value is the register AND one more
+    /// than the BASE address's high byte — and if the index crosses
+    /// a page, that value replaces the target's high byte too.
+    /// Nobody designed this; the adder and the store simply collide.
+    fn strange_store(&mut self, mode: AddressingMode, register: u8) {
+        let (base, index) = match mode {
+            AddressingMode::AbsoluteX => {
+                let base = self.read_word(self.pc);
+                self.pc = self.pc.wrapping_add(2);
+                (base, self.x)
+            }
+            AddressingMode::AbsoluteY => {
+                let base = self.read_word(self.pc);
+                self.pc = self.pc.wrapping_add(2);
+                (base, self.y)
+            }
+            _ => {
+                // ($xx),Y — the zero-page pointer, then Y.
+                let spot = self.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                let low = self.read(spot as u16) as u16;
+                let high = self.read(spot.wrapping_add(1) as u16) as u16;
+                ((high << 8) | low, self.y)
+            }
+        };
+        let target = base.wrapping_add(index as u16);
+        self.read((base & 0xFF00) | (target & 0x00FF));
+        let value = register & ((base >> 8) as u8).wrapping_add(1);
+        let address = if crosses_a_page(base, target) {
+            ((value as u16) << 8) | (target & 0x00FF)
+        } else {
+            target
+        };
+        self.crossed = false;
+        self.write(address, value);
     }
 
     /// INC's worker: one more, clock rules.
@@ -1298,6 +1691,38 @@ impl Cpu {
             0xEA => ("NOP", 1),
             0x00 => ("BRK", 1),
 
+            // The army, for the disassembler's benefit — nestest's
+            // own log marks them with a star.
+            0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => ("*NOP", 1),
+            0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 => ("*NOP", 2),
+            0x04 | 0x44 | 0x64 | 0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 => ("*NOP", 2),
+            0x0C | 0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => ("*NOP", 3),
+            0xA7 | 0xB7 | 0xA3 | 0xB3 | 0xAB => ("*LAX", 2),
+            0xAF | 0xBF => ("*LAX", 3),
+            0x87 | 0x97 | 0x83 => ("*SAX", 2),
+            0x8F => ("*SAX", 3),
+            0xEB => ("*SBC", 2),
+            0xC7 | 0xD7 | 0xC3 | 0xD3 => ("*DCP", 2),
+            0xCF | 0xDF | 0xDB => ("*DCP", 3),
+            0xE7 | 0xF7 | 0xE3 | 0xF3 => ("*ISB", 2),
+            0xEF | 0xFF | 0xFB => ("*ISB", 3),
+            0x07 | 0x17 | 0x03 | 0x13 => ("*SLO", 2),
+            0x0F | 0x1F | 0x1B => ("*SLO", 3),
+            0x27 | 0x37 | 0x23 | 0x33 => ("*RLA", 2),
+            0x2F | 0x3F | 0x3B => ("*RLA", 3),
+            0x47 | 0x57 | 0x43 | 0x53 => ("*SRE", 2),
+            0x4F | 0x5F | 0x5B => ("*SRE", 3),
+            0x67 | 0x77 | 0x63 | 0x73 => ("*RRA", 2),
+            0x6F | 0x7F | 0x7B => ("*RRA", 3),
+            0x0B | 0x2B => ("*ANC", 2),
+            0x4B => ("*ALR", 2),
+            0x6B => ("*ARR", 2),
+            0xCB => ("*AXS", 2),
+            0x8B => ("*XAA", 2),
+            0xBB => ("*LAS", 3),
+            0x93 => ("*SHA", 2),
+            0x9F | 0x9E | 0x9B => ("*SHA", 3),
+            0x9C => ("*SHY", 3),
             _ => return None,
         })
     }
@@ -2180,5 +2605,66 @@ mod tests {
         cpu.step();
         assert_eq!(cpu.pc, 0x9100); // BRK bowed; the NMI took the vector
         assert!(!cpu.nmi_pending.get());
+    }
+    #[test]
+    fn a_crossing_read_knocks_on_the_wrong_page_first() {
+        // LDA $21F4,X with X=$0E crosses into $2202 — but the extra
+        // cycle first reads $2102, which the mirroring folds onto
+        // $2002. The vblank flag is cleared by a read the program
+        // never wrote.
+        let mut cpu = Cpu::new(test_cartridge(&[0xBD, 0xF4, 0x21]));
+        cpu.reset();
+        cpu.x = 0x0E;
+        cpu.bus.ppu.vblank.set(true);
+        cpu.step();
+        assert!(!cpu.bus.ppu.vblank.get(), "the dummy read never knocked");
+    }
+
+    #[test]
+    fn a_rewrite_writes_the_old_byte_first() {
+        // INC $2006: reading the write-only register yields the
+        // latch's zero, and the double write then sets BOTH halves
+        // of the PPU's address in one instruction — old byte high,
+        // new byte low: $0001. A single write could never do that.
+        let mut cpu = Cpu::new(test_cartridge(&[0xEE, 0x06, 0x20]));
+        cpu.reset();
+        cpu.step();
+        assert_eq!(cpu.bus.ppu.data_address(), 0x0001);
+    }
+
+    #[test]
+    fn the_wire_remembers_the_last_byte() {
+        let cpu = Cpu::new(test_cartridge(&[]));
+        let seen = cpu.bus.read(0x8000);
+        assert_eq!(cpu.bus.read(0x4020), seen, "open bus forgot");
+        assert_eq!(cpu.bus.read(0x5A5A), seen, "open bus forgot");
+    }
+
+    #[test]
+    fn code_can_run_on_an_open_bus() {
+        // Park a NOP's opcode on the wire, point PC at unwired
+        // space, and the machine executes the wire's memory.
+        let mut cpu = Cpu::new(test_cartridge(&[0xEA]));
+        cpu.reset();
+        cpu.bus.read(0x8000); // the wire now holds $EA
+        cpu.pc = 0x4020;
+        cpu.step();
+        assert_eq!(cpu.pc, 0x4021, "the ghost NOP should execute");
+    }
+
+    #[test]
+    fn the_army_reports_for_duty() {
+        // LAX loads both pockets; DCP decrements and compares in one
+        // opcode. Two spot checks — the real examiner is nestest's
+        // golden log, all 8,991 lines of it.
+        let mut cpu = Cpu::new(test_cartridge(&[0xA7, 0x10, 0xC7, 0x10]));
+        cpu.reset();
+        cpu.bus.ram[0x10] = 0x55;
+        cpu.step();
+        assert_eq!((cpu.a, cpu.x), (0x55, 0x55), "LAX loads both");
+        cpu.a = 0x54;
+        cpu.step();
+        assert_eq!(cpu.bus.ram[0x10], 0x54, "DCP decremented");
+        assert_ne!(cpu.status & FLAG_ZERO, 0, "and compared equal");
     }
 }

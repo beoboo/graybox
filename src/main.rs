@@ -294,14 +294,8 @@ fn nestest_diff(rom_path: &str, log_path: &str) {
         }
         matched += 1;
 
-        if Cpu::opcode_name_and_length(cpu.read(cpu.pc)).is_none() {
-            println!(
-                "{matched} lines matched — then {:#04X}, an opcode we",
-                cpu.read(cpu.pc)
-            );
-            println!("don't implement. Unofficial. A Part II story.");
-            return;
-        }
+        // The early exit is gone: there is no opcode this machine
+        // doesn't know. The Part II story was this chapter.
         cpu.step();
     }
     println!("all {matched} lines matched");
