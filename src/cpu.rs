@@ -965,10 +965,6 @@ impl Cpu {
                 self.sp = self.a & self.x;
                 self.strange_store(AddressingMode::AbsoluteY, self.a & self.x);
             }
-
-            // An opcode we don't implement. Stopping loudly beats
-            // carrying on wrongly.
-            _ => panic!("I don't know opcode {opcode:#04X} yet!"),
         }
 
         // Bill the page-crossing surcharge, for the reads that met one.
