@@ -69,15 +69,6 @@ impl Pulse {
         self.timer = (self.timer & 0x0700) | value as u16;
     }
 
-    /// The half-frame beat: the sweep may bend the pitch, and the
-    /// alarm clock counts the note down.
-    fn half_frame(&mut self) {
-        if let Some(timer) = self.sweep.tick(self.timer) {
-            self.timer = timer;
-        }
-        self.length.tick();
-    }
-
     /// $4003 / $4007 — the timer's top three bits, and a note-on:
     /// the length counter loads, the envelope restarts, the shape
     /// restarts from step zero.
@@ -86,6 +77,15 @@ impl Pulse {
         self.length.load(value);
         self.envelope.start = true;
         self.phase = 0.0;
+    }
+
+    /// The half-frame beat: the sweep may bend the pitch, and the
+    /// alarm clock counts the note down.
+    fn half_frame(&mut self) {
+        if let Some(timer) = self.sweep.tick(self.timer) {
+            self.timer = timer;
+        }
+        self.length.tick();
     }
 
     /// The note being sung, in hertz: sixteen timer-loads of the
@@ -112,8 +112,8 @@ impl Pulse {
 /// half-frames. The order looks shuffled because the five register
 /// bits are really two smaller fields grown together in hardware.
 const LENGTH_TABLE: [u8; 32] = [
-    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
-    192, 24, 72, 26, 16, 28, 32, 30,
+    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14,
+    12, 16, 24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30,
 ];
 
 /// The note's alarm clock: loaded when a note starts, counted down at
@@ -374,647 +374,18 @@ impl Sweep {
     }
 }
 
-/// The sound chip: four singing voices, and the conductor that cues
-/// their counters.
-pub struct Apu {
-    pulse1: Pulse,
-    pulse2: Pulse,
-    triangle: Triangle,
-    noise: Noise,
-    dmc: Dmc,
-    filter: OutputFilter,
-    frame: FrameCounter,
-}
-
-impl Apu {
-    pub fn new() -> Apu {
-        Apu {
-            pulse1: Pulse::new(true),
-            pulse2: Pulse::new(false),
-            triangle: Triangle::new(),
-            noise: Noise::new(),
-            dmc: Dmc::new(),
-            filter: OutputFilter::new(),
-            frame: FrameCounter::new(),
-        }
-    }
-
-    /// A write to any sound register. Every voice answers now; only
-    /// the sample channel's registers still fall through, for one
-    /// more chapter.
-    pub fn write(&mut self, address: u16, value: u8) {
-        match address {
-            0x4000 => self.pulse1.write_control(value),
-            0x4001 => self.pulse1.sweep.write(value),
-            0x4002 => self.pulse1.write_timer_low(value),
-            0x4003 => self.pulse1.write_timer_high(value),
-            0x4004 => self.pulse2.write_control(value),
-            0x4005 => self.pulse2.sweep.write(value),
-            0x4006 => self.pulse2.write_timer_low(value),
-            0x4007 => self.pulse2.write_timer_high(value),
-            0x4008 => self.triangle.write_control(value),
-            0x400A => self.triangle.write_timer_low(value),
-            0x400B => self.triangle.write_timer_high(value),
-            0x400C => self.noise.write_control(value),
-            0x400E => self.noise.write_mode(value),
-            0x400F => self.noise.write_length(value),
-            0x4010 => self.dmc.write_control(value),
-            0x4011 => self.dmc.write_level(value),
-            0x4012 => self.dmc.write_address(value),
-            0x4013 => self.dmc.write_length(value),
-            0x4015 => {
-                self.pulse1.length.set_enabled(value & 0b0001 != 0);
-                self.pulse2.length.set_enabled(value & 0b0010 != 0);
-                self.triangle.length.set_enabled(value & 0b0100 != 0);
-                self.noise.length.set_enabled(value & 0b1000 != 0);
-                self.dmc
-                    .set_enabled(value & 0b1_0000 != 0, self.frame.apu_cycle);
-                self.dmc.irq_pending.set(false);
-            }
-            0x4017 => {
-                if self.frame.write(value) {
-                    self.quarter_frame();
-                    self.half_frame();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// One CPU cycle for the whole chip: the conductor beats, the
-    /// counters follow, and every length counter closes the cycle
-    /// knowing whether the next one carries its clock.
-    pub fn tick(&mut self) {
-        self.dmc.tick();
-        let (quarter, half) = self.frame.tick();
-        if quarter {
-            self.quarter_frame();
-        }
-        if half {
-            self.half_frame();
-        }
-
-        let imminent = self.frame.clocks_length_next();
-        self.pulse1.length.end_cycle(imminent);
-        self.pulse2.length.end_cycle(imminent);
-        self.triangle.length.end_cycle(imminent);
-        self.noise.length.end_cycle(imminent);
-    }
-
-    /// The quarter-frame beat: envelopes and the linear counter.
-    fn quarter_frame(&mut self) {
-        self.pulse1.envelope.tick();
-        self.pulse2.envelope.tick();
-        self.triangle.quarter_frame();
-        self.noise.envelope.tick();
-    }
-
-    /// The half-frame beat: sweeps and length counters.
-    fn half_frame(&mut self) {
-        self.pulse1.half_frame();
-        self.pulse2.half_frame();
-        self.triangle.length.tick();
-        self.noise.length.tick();
-    }
-    /// A read of $4015: which notes still sound, and whether the
-    /// conductor's IRQ is up. Reading clears the IRQ flag — one more
-    /// register where looking changes what you see.
-    pub fn read_status(&self) -> u8 {
-        let mut status = 0;
-        if self.pulse1.length.active() {
-            status |= 0b0001;
-        }
-        if self.pulse2.length.active() {
-            status |= 0b0010;
-        }
-        if self.triangle.length.active() {
-            status |= 0b0100;
-        }
-        if self.noise.length.active() {
-            status |= 0b1000;
-        }
-        if self.dmc.bytes_remaining > 0 {
-            status |= 0b1_0000;
-        }
-        if self.dmc.irq_pending.get() {
-            status |= 0b1000_0000;
-        }
-        if self.frame.take_irq() {
-            status |= 0b0100_0000;
-        }
-        status
-    }
-
-    /// Whether the chip is pulling the CPU's interrupt line: the
-    /// conductor's flag or the sampler's — live, both of them. The
-    /// one-cycle lag the poll needs lives in the CPU now, where it
-    /// can serve every line at once.
-    pub fn irq_pending(&self) -> bool {
-        self.frame.irq_pending.get() || self.dmc.irq_pending.get()
-    }
-
-    /// The sampler's fetch request, passed through for the CPU.
-    pub fn dmc_fetch(&mut self) -> Option<u16> {
-        self.dmc.take_fetch()
-    }
-
-    /// The DMA's answer, passed back in.
-    pub fn dmc_supply(&mut self, value: u8) {
-        self.dmc.supply(value);
-    }
-
-    /// One sample of the chip's output: all four voices, mixed the
-    /// way the silicon mixes them. The $4015 gates of chapter 19
-    /// live inside the length counters now.
-    pub fn sample(&mut self, sample_rate: f32) -> f32 {
-        let pulse1 = self.pulse1.sample(sample_rate);
-        let pulse2 = self.pulse2.sample(sample_rate);
-        let triangle = self.triangle.sample(sample_rate);
-        let noise = self.noise.sample(sample_rate);
-
-        let mixed = mix(pulse1, pulse2, triangle, noise, self.dmc.level);
-        self.filter.process(mixed, sample_rate)
-    }
-}
-
-/// The chip's two mixing curves, one per resistor ladder: the pulse
-/// pair on one, triangle-noise-sample on the other — the sample
-/// channel's name on that ladder finally cashed in. Neither curve
-/// is a plain sum: loud voices crowd each other instead of clipping.
-fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8, dmc: u8) -> f32 {
-    let pulses = (pulse1 + pulse2) as f32;
-    let pulse_out = if pulses == 0.0 {
-        0.0
-    } else {
-        95.88 / (8128.0 / pulses + 100.0)
-    };
-
-    let tnd = triangle as f32 / 8227.0 + noise as f32 / 12241.0 + dmc as f32 / 22638.0;
-    let tnd_out = if tnd == 0.0 {
-        0.0
-    } else {
-        159.79 / (1.0 / tnd + 100.0)
-    };
-
-    pulse_out + tnd_out
-}
-
-/// The console's last inch of wire: before the mixed signal reaches
-/// the speaker it crosses three little analogue stages — capacitors
-/// and resistors, not logic. Two high-passes (90 Hz and 440 Hz) pass
-/// CHANGE and block anything steady; one low-pass (14 kHz) rounds the
-/// harshest corners off the squares. This matters more than it looks:
-/// the mixer's silence is 0.0, not a midpoint, so an unfiltered note
-/// PARKS the speaker cone off-center — every start thumps, every DMC
-/// step clicks. The high-passes un-park it.
-struct OutputFilter {
-    hp90: (f32, f32),
-    hp440: (f32, f32),
-    lp14k: f32,
-}
-
-impl OutputFilter {
-    fn new() -> OutputFilter {
-        OutputFilter { hp90: (0.0, 0.0), hp440: (0.0, 0.0), lp14k: 0.0 }
-    }
-
-    fn process(&mut self, sample: f32, sample_rate: f32) -> f32 {
-        let sample = high_pass(&mut self.hp90, sample, 90.0, sample_rate);
-        let sample = high_pass(&mut self.hp440, sample, 440.0, sample_rate);
-        low_pass(&mut self.lp14k, sample, 14_000.0, sample_rate)
-    }
-}
-
-/// One resistor-capacitor stage, high-pass wiring: the output follows
-/// change in the input and decays toward zero when nothing changes.
-/// `state` is (previous input, previous output).
-fn high_pass(state: &mut (f32, f32), input: f32, cutoff: f32, sample_rate: f32) -> f32 {
-    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
-    let dt = 1.0 / sample_rate;
-    let alpha = rc / (rc + dt);
-    let output = alpha * (state.1 + input - state.0);
-    *state = (input, output);
-    output
-}
-
-/// The same stage, wired the other way: the output chases the input
-/// but can only move so fast, which sands the edges off a square.
-fn low_pass(state: &mut f32, input: f32, cutoff: f32, sample_rate: f32) -> f32 {
-    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
-    let dt = 1.0 / sample_rate;
-    let alpha = dt / (rc + dt);
-    *state += alpha * (input - *state);
-    *state
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A pulse mid-note, built the way the bus would build it. The
-    /// note-on only lands if the channel is enabled first — the same
-    /// order every real program follows.
-    fn singing(control: u8, timer: u16) -> Pulse {
-        let mut pulse = Pulse::new(true);
-        pulse.length.set_enabled(true);
-        pulse.write_control(control);
-        pulse.write_timer_low(timer as u8);
-        pulse.write_timer_high((timer >> 8) as u8);
-        pulse
-    }
-
-    /// Count how many times a second of output rises from silence —
-    /// which is the frequency, measured the way a tuner measures it.
-    fn risings_per_second(pulse: &mut Pulse) -> usize {
-        let mut count = 0;
-        let mut previous = 0;
-        for _ in 0..44_100 {
-            let sample = pulse.sample(44_100.0);
-            if previous == 0 && sample > 0 {
-                count += 1;
-            }
-            previous = sample;
-        }
-        count
-    }
-
-    #[test]
-    fn a_timer_of_253_sings_the_tuning_a() {
-        // 1,789,773 / (16 x 254) = 440.4 Hz — the A orchestras tune to.
-        let mut pulse = singing(0b0111_1111, 253);
-        let risings = risings_per_second(&mut pulse);
-        assert!((438..=442).contains(&risings), "sang {risings} Hz");
-    }
-
-    #[test]
-    fn volume_zero_and_tiny_timers_are_silence() {
-        let mut muted = singing(0b0111_0000, 253); // volume 0
-        let mut shrill = singing(0b0111_1111, 7); // timer under 8
-        for _ in 0..1000 {
-            assert_eq!(muted.sample(44_100.0), 0);
-            assert_eq!(shrill.sample(44_100.0), 0);
-        }
-    }
-
-    #[test]
-    fn the_switchboard_silences_a_disabled_voice() {
-        let mut apu = Apu::new();
-        apu.write(0x4000, 0b0111_1111);
-        apu.write(0x4002, 253);
-        apu.write(0x4015, 0b0000_0010); // pulse 2 on — pulse 1 OFF
-        for _ in 0..1000 {
-            assert_eq!(apu.sample(44_100.0), 0.0);
-        }
-    }
-    #[test]
-    fn the_fat_square_is_up_half_the_time() {
-        // Same test as chapter 19 wrote it, one bit different: bit 4
-        // now asks for constant volume, which is what "volume 15"
-        // always secretly was.
-        let mut pulse = singing(0b1001_1111, 253);
-        let loud = (0..44_100).filter(|_| pulse.sample(44_100.0) > 0).count();
-        let ratio = loud as f32 / 44_100.0;
-        assert!((0.45..=0.55).contains(&ratio), "up {ratio} of the time");
-    }
-
-    #[test]
-    fn the_mixer_squashes_instead_of_clipping() {
-        // Both pulses at full blast: the mix stays shy of 0.26, the
-        // resistor ladder's ceiling — not 2 x anything.
-        assert!(mix(15, 15, 0, 0, 0) < 0.26);
-        assert!(mix(15, 15, 0, 0, 0) < 2.0 * mix(15, 0, 0, 0, 0));
-        assert_eq!(mix(0, 0, 0, 0, 0), 0.0);
-    }
-
-    #[test]
-    fn the_second_ladder_mixes_the_new_voices() {
-        // The triangle alone registers louder than the noise alone at
-        // equal levels — the resistor ratios say so — and both crowd
-        // rather than sum. The sampler rides the same ladder, at the
-        // quietest tap of the three.
-        assert!(mix(0, 0, 15, 0, 0) > mix(0, 0, 0, 15, 0));
-        assert!(mix(0, 0, 0, 15, 0) > mix(0, 0, 0, 0, 15));
-        let both = mix(0, 0, 15, 15, 0);
-        assert!(both < mix(0, 0, 15, 0, 0) + mix(0, 0, 0, 15, 0));
-        assert!(both > 0.0);
-    }
-
-    /// Tick the whole chip for a stretch of CPU cycles.
-    fn run(apu: &mut Apu, cycles: u64) {
-        for _ in 0..cycles {
-            apu.tick();
-        }
-    }
-
-    #[test]
-    fn the_conductor_beats_four_times_a_sequence() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0001);
-        apu.write(0x4000, 0b0001_1111); // halt off, constant volume
-        apu.write(0x4003, 0); // length index 0: ten half-frames
-
-        // Ten half-frames arrive over five sequences of the 4-step
-        // beat. One cycle short of the fifth sequence's last clock,
-        // the note still sounds; one cycle later it is cut.
-        run(&mut apu, 4 * 29830 + 29828);
-        assert_ne!(apu.read_status() & 0b0001, 0, "cut too early");
-        run(&mut apu, 1);
-        assert_eq!(apu.read_status() & 0b0001, 0, "still on at ten");
-    }
-
-    #[test]
-    fn the_halt_flag_holds_a_note_forever() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0001);
-        apu.write(0x4000, 0b0011_1111); // bit 5: halt ON
-        apu.write(0x4003, 0);
-
-        run(&mut apu, 29830 * 20);
-        assert_ne!(apu.read_status() & 0b0001, 0, "halted note ended");
-    }
-
-    #[test]
-    fn disabling_a_channel_cuts_its_note_now() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0001);
-        apu.write(0x4003, 0);
-        assert_ne!(apu.read_status() & 0b0001, 0);
-
-        apu.write(0x4015, 0);
-        assert_eq!(apu.read_status() & 0b0001, 0, "disable must silence");
-
-        // And a note-on while disabled must not stick.
-        apu.write(0x4003, 0);
-        assert_eq!(apu.read_status() & 0b0001, 0, "loaded while disabled");
-    }
-
-    #[test]
-    fn the_envelope_decays_and_the_constant_bit_bypasses_it() {
-        let mut envelope = Envelope::new();
-        envelope.write(0b0000_0000); // decay mode, fastest rate
-        envelope.start = true;
-        envelope.tick();
-        assert_eq!(envelope.volume(), 15, "decay starts from the top");
-        for _ in 0..15 {
-            envelope.tick();
-        }
-        assert_eq!(envelope.volume(), 0, "and walks to silence");
-
-        envelope.write(0b0001_0101); // constant volume 5
-        assert_eq!(envelope.volume(), 5, "constant mode reads the period");
-    }
-
-    #[test]
-    fn the_sweep_bends_and_its_mute_rule_never_sleeps() {
-        let mut pulse = singing(0b0011_1111, 100);
-
-        // Sweep up, shift 2: 100 + 25 = 125 at the first half-frame.
-        pulse.sweep.write(0b1000_0010);
-        pulse.half_frame();
-        assert_eq!(pulse.timer, 125, "the bend moved the pitch");
-
-        // A target past $7FF mutes the voice even between beats:
-        // $700 + ($700 >> 2) overflows the eleven bits.
-        pulse.timer = 0x700;
-        assert!(pulse.sweep.mutes(pulse.timer));
-        assert_eq!(pulse.sample(44_100.0), 0);
-    }
-
-    #[test]
-    fn pulse_one_negates_one_deeper_than_pulse_two() {
-        let mut one = Sweep::new(true);
-        let mut two = Sweep::new(false);
-        one.write(0b1000_1010); // negate, shift 2
-        two.write(0b1000_1010);
-        assert_eq!(one.target(100), 74, "ones' complement: 100 - 25 - 1");
-        assert_eq!(two.target(100), 75, "two's complement: 100 - 25");
-    }
-
-    #[test]
-    fn the_triangle_needs_both_locks_open() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0100);
-        apu.write(0x4008, 0x81); // hold bit + linear reload 1
-        apu.write(0x400A, 70); // the 788 Hz lead from Lan Master
-        apu.write(0x400B, 0); // note-on
-
-        // Before any quarter-frame the linear counter is still zero:
-        // the length lock is open, the linear lock is not.
-        assert_eq!(apu.triangle.sample(44_100.0), 0, "linear lock closed");
-        run(&mut apu, 7457); // the first quarter-frame beat
-        let mut sang = false;
-        for _ in 0..100 {
-            sang |= apu.triangle.sample(44_100.0) > 0;
-        }
-        assert!(sang, "both locks open, still silent");
-
-        // A note-off the FamiTone way: reload value zero.
-        apu.write(0x4008, 0x80);
-        run(&mut apu, 29830);
-        assert_eq!(apu.triangle.sample(44_100.0), 0, "note-off ignored");
-    }
-
-    #[test]
-    fn the_triangle_walks_all_thirty_two_steps() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0100);
-        apu.write(0x4008, 0xFF);
-        apu.write(0x400A, 70);
-        apu.write(0x400B, 0);
-        run(&mut apu, 7457);
-
-        let mut seen = [false; 16];
-        for _ in 0..1000 {
-            seen[apu.triangle.sample(44_100.0) as usize] = true;
-        }
-        assert!(seen.iter().all(|s| *s), "some staircase level missing");
-    }
-
-    #[test]
-    fn the_noise_register_ticks_like_the_hardware() {
-        let mut noise = Noise::new();
-        // Mode 1 turns the register into a 93-step loop; walk one
-        // full loop and land back at the seed.
-        noise.mode = true;
-        let seed = noise.lfsr;
-        for _ in 0..93 {
-            noise.shift();
-        }
-        assert_eq!(noise.lfsr, seed, "mode 1 is a 93-step pattern");
-
-        // Mode 0 must NOT close after 93 — its period is 32,767.
-        noise.mode = false;
-        noise.lfsr = 1;
-        for _ in 0..93 {
-            noise.shift();
-        }
-        assert_ne!(noise.lfsr, 1, "mode 0 closed far too soon");
-    }
-
-    #[test]
-    fn reading_status_clears_the_conductors_irq() {
-        let mut apu = Apu::new();
-        run(&mut apu, 29830);
-        let first = apu.read_status();
-        assert_ne!(first & 0b0100_0000, 0, "the sequence's end raises it");
-        let second = apu.read_status();
-        assert_eq!(second & 0b0100_0000, 0, "and reading clears it");
-    }
-
-    #[test]
-    fn the_inhibit_bit_silences_the_conductor() {
-        let mut apu = Apu::new();
-        apu.write(0x4017, 0b0100_0000);
-        run(&mut apu, 29830 * 3);
-        assert_eq!(apu.read_status() & 0b0100_0000, 0, "inhibited IRQ fired");
-    }
-
-    #[test]
-    fn a_4017_write_restarts_the_sequence_a_moment_later() {
-        let mut apu = Apu::new();
-        // Get near the first beat, then restart: the sequence starts
-        // over — three cycles late, because the write landed on an
-        // APU cycle (four, had it landed between two).
-        run(&mut apu, 7000);
-        apu.write(0x4017, 0);
-        run(&mut apu, 1000);
-        assert_eq!(apu.frame.cycle, 997, "restart was not deferred by 3");
-    }
-
-    #[test]
-    fn the_five_step_bit_clocks_everything_immediately() {
-        let mut apu = Apu::new();
-        apu.write(0x4015, 0b0001);
-        apu.write(0x4000, 0b0001_1111); // halt off
-        apu.write(0x4003, 0b1111_1000); // length index 31: thirty
-
-        // No conductor beat has happened — but the 5-step bit brings
-        // its own: one write, and thirty is already twenty-nine.
-        apu.write(0x4017, 0b1000_0000);
-        assert_eq!(apu.pulse1.length.counter, 29, "no immediate clock");
-    }
-    #[test]
-    fn the_sampler_asks_the_moment_its_buffer_is_empty() {
-        let mut apu = Apu::new();
-        apu.write(0x4012, 2); // sample at $C000 + 2 x 64
-        apu.write(0x4013, 1); // 17 bytes
-        apu.write(0x4015, 0b1_0000);
-
-        // The request surfaces a couple of cycles later — parity
-        // manners — and names the sample's first address.
-        assert_eq!(apu.dmc_fetch(), None, "asked before the delay ran out");
-        run(&mut apu, 3);
-        assert_eq!(apu.dmc_fetch(), Some(0xC080));
-    }
-
-    #[test]
-    fn each_bit_nudges_the_level_by_two() {
-        let mut apu = Apu::new();
-        apu.write(0x4012, 0);
-        apu.write(0x4013, 0); // "zero" still means one byte
-        apu.write(0x4015, 0b1_0000);
-        run(&mut apu, 3);
-        apu.dmc_fetch();
-        apu.dmc_supply(0b1111_1111); // eight steps up
-
-        // The output unit must first shift out the eight silent bits
-        // it woke up with; only then does the byte load and nudge the
-        // level up 2 x 8 = 16 over the next eight periods.
-        run(&mut apu, 428 * 18);
-        assert_eq!(apu.dmc.level, 16);
-    }
-
-    #[test]
-    fn the_level_never_leaves_its_seven_bits() {
-        let mut apu = Apu::new();
-        apu.write(0x4011, 0x7E); // near the top
-        apu.write(0x4012, 0);
-        apu.write(0x4013, 0);
-        apu.write(0x4015, 0b1_0000);
-        run(&mut apu, 3);
-        apu.dmc_fetch();
-        apu.dmc_supply(0xFF); // eight more ups
-        run(&mut apu, 428 * 18);
-        assert!(apu.dmc.level <= 0x7F, "the DAC is seven bits wide");
-    }
-
-    #[test]
-    fn a_finished_sample_raises_the_irq_and_4015_reports_it() {
-        let mut apu = Apu::new();
-        apu.write(0x4010, 0b1000_0000); // IRQ on, no loop
-        apu.write(0x4012, 0);
-        apu.write(0x4013, 0); // one byte
-        apu.write(0x4015, 0b1_0000);
-        run(&mut apu, 3);
-        let address = apu.dmc_fetch().unwrap();
-        apu.dmc_supply(0x00);
-        assert_eq!(address, 0xC000);
-        assert_ne!(apu.read_status() & 0b1000_0000, 0, "the sample ended");
-
-        // Writing $4015 clears the sampler's IRQ — that is the
-        // acknowledgement games use.
-        apu.write(0x4015, 0);
-        assert_eq!(apu.read_status() & 0b1000_0000, 0);
-    }
-
-    #[test]
-    fn a_byte_for_a_cancelled_sample_changes_nothing() {
-        let mut apu = Apu::new();
-        apu.write(0x4012, 0);
-        apu.write(0x4013, 1);
-        apu.write(0x4015, 0b1_0000);
-        run(&mut apu, 3);
-        apu.dmc_fetch();
-
-        // The game calls the sample off while the DMA is in flight.
-        apu.write(0x4015, 0);
-        apu.dmc_supply(0xAA);
-
-        // The late byte must not resurrect it: a $4015 read that
-        // says "still playing" here would say it forever.
-        assert_eq!(apu.read_status() & 0b1_0000, 0, "a ghost sample plays on");
-    }
-
-    #[test]
-    fn the_filter_unparks_the_speaker() {
-        // A steady level is exactly what the mixer emits mid-note.
-        // The high-passes must walk it back to zero — no parked cone,
-        // no thump.
-        let mut filter = OutputFilter::new();
-        let mut last = 1.0;
-        for _ in 0..44_100 {
-            last = filter.process(0.5, 44_100.0);
-        }
-        assert!(last.abs() < 0.001, "DC survived: {last}");
-    }
-
-    #[test]
-    fn the_filter_lets_the_music_through() {
-        // A 1 kHz wobble sits squarely between the corners and must
-        // keep most of its size.
-        let mut filter = OutputFilter::new();
-        let mut peak: f32 = 0.0;
-        for n in 0..44_100 {
-            let t = n as f32 / 44_100.0;
-            let out = filter.process((2.0 * std::f32::consts::PI * 1000.0 * t).sin(), 44_100.0);
-            if n > 22_050 {
-                peak = peak.max(out.abs());
-            }
-        }
-        assert!(peak > 0.8, "the tone was crushed to {peak}");
-    }
-}
-
 /// The 4-step conductor's beat, in CPU cycles from the sequence's
 /// start: which cycles clock the quarter-frame units, and which of
 /// those also clock the half-frame units (`true`).
-const FOUR_STEP: [(u64, bool); 4] = [(7457, false), (14913, true), (22371, false), (29829, true)];
+const FOUR_STEP: [(u64, bool); 4] =
+    [(7457, false), (14913, true), (22371, false), (29829, true)];
 
 /// One cycle past the 4-step sequence's last clock: where it wraps.
 const FOUR_STEP_WRAP: u64 = 29830;
 
 /// The 5-step beat: same first three clocks, a longer tail, no IRQ.
-const FIVE_STEP: [(u64, bool); 4] = [(7457, false), (14913, true), (22371, false), (37281, true)];
+const FIVE_STEP: [(u64, bool); 4] =
+    [(7457, false), (14913, true), (22371, false), (37281, true)];
 
 /// Where the 5-step sequence wraps.
 const FIVE_STEP_WRAP: u64 = 37282;
@@ -1134,12 +505,13 @@ impl FrameCounter {
         pending
     }
 }
+
 /// The triangle's staircase, thirty-two steps down then up. No
 /// volume knob anywhere: the wave plays at one loudness or not at
 /// all.
 const TRIANGLE_STEPS: [u8; 32] = [
-    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 15,
+    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ];
 
 /// The third voice: the triangle, the console's bass. Its timer runs
@@ -1429,6 +801,7 @@ impl Dmc {
         self.current_address = 0xC000 | ((self.sample_address as u16) << 6);
         self.bytes_remaining = ((self.sample_length as u16) << 4) | 1;
     }
+
     /// The $4015 bit: enabling starts the sample (unless one is
     /// mid-flight); disabling stops it now. The parity decides the
     /// start-up delay — see `start_delay`.
@@ -1529,5 +902,640 @@ impl Dmc {
             }
         }
     }
+}
 
+/// The sound chip: four singing voices, and the conductor that cues
+/// their counters.
+pub struct Apu {
+    pulse1: Pulse,
+    pulse2: Pulse,
+    triangle: Triangle,
+    noise: Noise,
+    dmc: Dmc,
+    filter: OutputFilter,
+    frame: FrameCounter,
+}
+
+impl Apu {
+    pub fn new() -> Apu {
+        Apu {
+            pulse1: Pulse::new(true),
+            pulse2: Pulse::new(false),
+            triangle: Triangle::new(),
+            noise: Noise::new(),
+            dmc: Dmc::new(),
+            filter: OutputFilter::new(),
+            frame: FrameCounter::new(),
+        }
+    }
+
+    /// A write to any sound register. Every voice answers now; only
+    /// the sample channel's registers still fall through, for one
+    /// more chapter.
+    pub fn write(&mut self, address: u16, value: u8) {
+        match address {
+            0x4000 => self.pulse1.write_control(value),
+            0x4001 => self.pulse1.sweep.write(value),
+            0x4002 => self.pulse1.write_timer_low(value),
+            0x4003 => self.pulse1.write_timer_high(value),
+            0x4004 => self.pulse2.write_control(value),
+            0x4005 => self.pulse2.sweep.write(value),
+            0x4006 => self.pulse2.write_timer_low(value),
+            0x4007 => self.pulse2.write_timer_high(value),
+            0x4008 => self.triangle.write_control(value),
+            0x400A => self.triangle.write_timer_low(value),
+            0x400B => self.triangle.write_timer_high(value),
+            0x400C => self.noise.write_control(value),
+            0x400E => self.noise.write_mode(value),
+            0x400F => self.noise.write_length(value),
+            0x4010 => self.dmc.write_control(value),
+            0x4011 => self.dmc.write_level(value),
+            0x4012 => self.dmc.write_address(value),
+            0x4013 => self.dmc.write_length(value),
+            0x4015 => {
+                self.pulse1.length.set_enabled(value & 0b0001 != 0);
+                self.pulse2.length.set_enabled(value & 0b0010 != 0);
+                self.triangle.length.set_enabled(value & 0b0100 != 0);
+                self.noise.length.set_enabled(value & 0b1000 != 0);
+                self.dmc.set_enabled(value & 0b1_0000 != 0, self.frame.apu_cycle);
+                self.dmc.irq_pending.set(false);
+            }
+            0x4017 => {
+                if self.frame.write(value) {
+                    self.quarter_frame();
+                    self.half_frame();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One CPU cycle for the whole chip: the conductor beats, the
+    /// counters follow, and every length counter closes the cycle
+    /// knowing whether the next one carries its clock.
+    pub fn tick(&mut self) {
+        self.dmc.tick();
+        let (quarter, half) = self.frame.tick();
+        if quarter {
+            self.quarter_frame();
+        }
+        if half {
+            self.half_frame();
+        }
+
+        let imminent = self.frame.clocks_length_next();
+        self.pulse1.length.end_cycle(imminent);
+        self.pulse2.length.end_cycle(imminent);
+        self.triangle.length.end_cycle(imminent);
+        self.noise.length.end_cycle(imminent);
+    }
+
+    /// The quarter-frame beat: envelopes and the linear counter.
+    fn quarter_frame(&mut self) {
+        self.pulse1.envelope.tick();
+        self.pulse2.envelope.tick();
+        self.triangle.quarter_frame();
+        self.noise.envelope.tick();
+    }
+
+    /// The half-frame beat: sweeps and length counters.
+    fn half_frame(&mut self) {
+        self.pulse1.half_frame();
+        self.pulse2.half_frame();
+        self.triangle.length.tick();
+        self.noise.length.tick();
+    }
+
+    /// A read of $4015: which notes still sound, and whether the
+    /// conductor's IRQ is up. Reading clears the IRQ flag — one more
+    /// register where looking changes what you see.
+    pub fn read_status(&self) -> u8 {
+        let mut status = 0;
+        if self.pulse1.length.active() {
+            status |= 0b0001;
+        }
+        if self.pulse2.length.active() {
+            status |= 0b0010;
+        }
+        if self.triangle.length.active() {
+            status |= 0b0100;
+        }
+        if self.noise.length.active() {
+            status |= 0b1000;
+        }
+        if self.dmc.bytes_remaining > 0 {
+            status |= 0b1_0000;
+        }
+        if self.dmc.irq_pending.get() {
+            status |= 0b1000_0000;
+        }
+        if self.frame.take_irq() {
+            status |= 0b0100_0000;
+        }
+        status
+    }
+
+    /// Whether the chip is pulling the CPU's interrupt line: the
+    /// conductor's flag or the sampler's — live, both of them. The
+    /// one-cycle lag the poll needs lives in the CPU now, where it
+    /// can serve every line at once.
+    pub fn irq_pending(&self) -> bool {
+        self.frame.irq_pending.get() || self.dmc.irq_pending.get()
+    }
+
+    /// The sampler's fetch request, passed through for the CPU.
+    pub fn dmc_fetch(&mut self) -> Option<u16> {
+        self.dmc.take_fetch()
+    }
+
+    /// The DMA's answer, passed back in.
+    pub fn dmc_supply(&mut self, value: u8) {
+        self.dmc.supply(value);
+    }
+
+    /// One sample of the chip's output: all four voices, mixed the
+    /// way the silicon mixes them. The $4015 gates of chapter 19
+    /// live inside the length counters now.
+    pub fn sample(&mut self, sample_rate: f32) -> f32 {
+        let pulse1 = self.pulse1.sample(sample_rate);
+        let pulse2 = self.pulse2.sample(sample_rate);
+        let triangle = self.triangle.sample(sample_rate);
+        let noise = self.noise.sample(sample_rate);
+
+        let mixed = mix(pulse1, pulse2, triangle, noise, self.dmc.level);
+        self.filter.process(mixed, sample_rate)
+    }
+}
+
+/// The chip's two mixing curves, one per resistor ladder: the pulse
+/// pair on one, triangle-noise-sample on the other — the sample
+/// channel's name on that ladder finally cashed in. Neither curve
+/// is a plain sum: loud voices crowd each other instead of clipping.
+fn mix(pulse1: u8, pulse2: u8, triangle: u8, noise: u8, dmc: u8) -> f32 {
+    let pulses = (pulse1 + pulse2) as f32;
+    let pulse_out = if pulses == 0.0 {
+        0.0
+    } else {
+        95.88 / (8128.0 / pulses + 100.0)
+    };
+
+    let tnd =
+        triangle as f32 / 8227.0 + noise as f32 / 12241.0 + dmc as f32 / 22638.0;
+    let tnd_out = if tnd == 0.0 {
+        0.0
+    } else {
+        159.79 / (1.0 / tnd + 100.0)
+    };
+
+    pulse_out + tnd_out
+}
+
+/// The console's last inch of wire: before the mixed signal reaches
+/// the speaker it crosses three little analogue stages — capacitors
+/// and resistors, not logic. Two high-passes (90 Hz and 440 Hz) pass
+/// CHANGE and block anything steady; one low-pass (14 kHz) rounds the
+/// harshest corners off the squares. This matters more than it looks:
+/// the mixer's silence is 0.0, not a midpoint, so an unfiltered note
+/// PARKS the speaker cone off-center — every start thumps, every DMC
+/// step clicks. The high-passes un-park it.
+struct OutputFilter {
+    hp90: (f32, f32),
+    hp440: (f32, f32),
+    lp14k: f32,
+}
+
+impl OutputFilter {
+    fn new() -> OutputFilter {
+        OutputFilter { hp90: (0.0, 0.0), hp440: (0.0, 0.0), lp14k: 0.0 }
+    }
+
+    fn process(&mut self, sample: f32, sample_rate: f32) -> f32 {
+        let sample = high_pass(&mut self.hp90, sample, 90.0, sample_rate);
+        let sample = high_pass(&mut self.hp440, sample, 440.0, sample_rate);
+        low_pass(&mut self.lp14k, sample, 14_000.0, sample_rate)
+    }
+}
+
+/// One resistor-capacitor stage, high-pass wiring: the output follows
+/// change in the input and decays toward zero when nothing changes.
+/// `state` is (previous input, previous output).
+fn high_pass(state: &mut (f32, f32), input: f32, cutoff: f32, sample_rate: f32) -> f32 {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    let dt = 1.0 / sample_rate;
+    let alpha = rc / (rc + dt);
+    let output = alpha * (state.1 + input - state.0);
+    *state = (input, output);
+    output
+}
+
+/// The same stage, wired the other way: the output chases the input
+/// but can only move so fast, which sands the edges off a square.
+fn low_pass(state: &mut f32, input: f32, cutoff: f32, sample_rate: f32) -> f32 {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    let dt = 1.0 / sample_rate;
+    let alpha = dt / (rc + dt);
+    *state += alpha * (input - *state);
+    *state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pulse mid-note, built the way the bus would build it. The
+    /// note-on only lands if the channel is enabled first — the same
+    /// order every real program follows.
+    fn singing(control: u8, timer: u16) -> Pulse {
+        let mut pulse = Pulse::new(true);
+        pulse.length.set_enabled(true);
+        pulse.write_control(control);
+        pulse.write_timer_low(timer as u8);
+        pulse.write_timer_high((timer >> 8) as u8);
+        pulse
+    }
+
+    /// Count how many times a second of output rises from silence —
+    /// which is the frequency, measured the way a tuner measures it.
+    fn risings_per_second(pulse: &mut Pulse) -> usize {
+        let mut count = 0;
+        let mut previous = 0;
+        for _ in 0..44_100 {
+            let sample = pulse.sample(44_100.0);
+            if previous == 0 && sample > 0 {
+                count += 1;
+            }
+            previous = sample;
+        }
+        count
+    }
+
+    #[test]
+    fn a_timer_of_253_sings_the_tuning_a() {
+        // 1,789,773 / (16 x 254) = 440.4 Hz — the A orchestras tune to.
+        let mut pulse = singing(0b0111_1111, 253);
+        let risings = risings_per_second(&mut pulse);
+        assert!((438..=442).contains(&risings), "sang {risings} Hz");
+    }
+
+    #[test]
+    fn volume_zero_and_tiny_timers_are_silence() {
+        let mut muted = singing(0b0111_0000, 253); // volume 0
+        let mut shrill = singing(0b0111_1111, 7); // timer under 8
+        for _ in 0..1000 {
+            assert_eq!(muted.sample(44_100.0), 0);
+            assert_eq!(shrill.sample(44_100.0), 0);
+        }
+    }
+
+    #[test]
+    fn the_switchboard_silences_a_disabled_voice() {
+        let mut apu = Apu::new();
+        apu.write(0x4000, 0b0111_1111);
+        apu.write(0x4002, 253);
+        apu.write(0x4015, 0b0000_0010); // pulse 2 on — pulse 1 OFF
+        for _ in 0..1000 {
+            assert_eq!(apu.sample(44_100.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn the_fat_square_is_up_half_the_time() {
+        // Same test as chapter 19 wrote it, one bit different: bit 4
+        // now asks for constant volume, which is what "volume 15"
+        // always secretly was.
+        let mut pulse = singing(0b1001_1111, 253);
+        let loud = (0..44_100)
+            .filter(|_| pulse.sample(44_100.0) > 0)
+            .count();
+        let ratio = loud as f32 / 44_100.0;
+        assert!((0.45..=0.55).contains(&ratio), "up {ratio} of the time");
+    }
+
+    #[test]
+    fn the_mixer_squashes_instead_of_clipping() {
+        // Both pulses at full blast: the mix stays shy of 0.26, the
+        // resistor ladder's ceiling — not 2 x anything.
+        assert!(mix(15, 15, 0, 0, 0) < 0.26);
+        assert!(mix(15, 15, 0, 0, 0) < 2.0 * mix(15, 0, 0, 0, 0));
+        assert_eq!(mix(0, 0, 0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn the_second_ladder_mixes_the_new_voices() {
+        // The triangle alone registers louder than the noise alone at
+        // equal levels — the resistor ratios say so — and both crowd
+        // rather than sum. The sampler rides the same ladder, at the
+        // quietest tap of the three.
+        assert!(mix(0, 0, 15, 0, 0) > mix(0, 0, 0, 15, 0));
+        assert!(mix(0, 0, 0, 15, 0) > mix(0, 0, 0, 0, 15));
+        let both = mix(0, 0, 15, 15, 0);
+        assert!(both < mix(0, 0, 15, 0, 0) + mix(0, 0, 0, 15, 0));
+        assert!(both > 0.0);
+    }
+
+    /// Tick the whole chip for a stretch of CPU cycles.
+    fn run(apu: &mut Apu, cycles: u64) {
+        for _ in 0..cycles {
+            apu.tick();
+        }
+    }
+
+    #[test]
+    fn the_conductor_beats_four_times_a_sequence() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0001);
+        apu.write(0x4000, 0b0001_1111); // halt off, constant volume
+        apu.write(0x4003, 0); // length index 0: ten half-frames
+
+        // Ten half-frames arrive over five sequences of the 4-step
+        // beat. One cycle short of the fifth sequence's last clock,
+        // the note still sounds; one cycle later it is cut.
+        run(&mut apu, 4 * 29830 + 29828);
+        assert_ne!(apu.read_status() & 0b0001, 0, "cut too early");
+        run(&mut apu, 1);
+        assert_eq!(apu.read_status() & 0b0001, 0, "still on at ten");
+    }
+
+    #[test]
+    fn the_halt_flag_holds_a_note_forever() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0001);
+        apu.write(0x4000, 0b0011_1111); // bit 5: halt ON
+        apu.write(0x4003, 0);
+
+        run(&mut apu, 29830 * 20);
+        assert_ne!(apu.read_status() & 0b0001, 0, "halted note ended");
+    }
+
+    #[test]
+    fn disabling_a_channel_cuts_its_note_now() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0001);
+        apu.write(0x4003, 0);
+        assert_ne!(apu.read_status() & 0b0001, 0);
+
+        apu.write(0x4015, 0);
+        assert_eq!(apu.read_status() & 0b0001, 0, "disable must silence");
+
+        // And a note-on while disabled must not stick.
+        apu.write(0x4003, 0);
+        assert_eq!(apu.read_status() & 0b0001, 0, "loaded while disabled");
+    }
+
+    #[test]
+    fn the_envelope_decays_and_the_constant_bit_bypasses_it() {
+        let mut envelope = Envelope::new();
+        envelope.write(0b0000_0000); // decay mode, fastest rate
+        envelope.start = true;
+        envelope.tick();
+        assert_eq!(envelope.volume(), 15, "decay starts from the top");
+        for _ in 0..15 {
+            envelope.tick();
+        }
+        assert_eq!(envelope.volume(), 0, "and walks to silence");
+
+        envelope.write(0b0001_0101); // constant volume 5
+        assert_eq!(envelope.volume(), 5, "constant mode reads the period");
+    }
+
+    #[test]
+    fn the_sweep_bends_and_its_mute_rule_never_sleeps() {
+        let mut pulse = singing(0b0011_1111, 100);
+
+        // Sweep up, shift 2: 100 + 25 = 125 at the first half-frame.
+        pulse.sweep.write(0b1000_0010);
+        pulse.half_frame();
+        assert_eq!(pulse.timer, 125, "the bend moved the pitch");
+
+        // A target past $7FF mutes the voice even between beats:
+        // $700 + ($700 >> 2) overflows the eleven bits.
+        pulse.timer = 0x700;
+        assert!(pulse.sweep.mutes(pulse.timer));
+        assert_eq!(pulse.sample(44_100.0), 0);
+    }
+
+    #[test]
+    fn pulse_one_negates_one_deeper_than_pulse_two() {
+        let mut one = Sweep::new(true);
+        let mut two = Sweep::new(false);
+        one.write(0b1000_1010); // negate, shift 2
+        two.write(0b1000_1010);
+        assert_eq!(one.target(100), 74, "ones' complement: 100 - 25 - 1");
+        assert_eq!(two.target(100), 75, "two's complement: 100 - 25");
+    }
+
+    #[test]
+    fn the_triangle_needs_both_locks_open() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0100);
+        apu.write(0x4008, 0x81); // hold bit + linear reload 1
+        apu.write(0x400A, 70); // the 788 Hz lead from Lan Master
+        apu.write(0x400B, 0); // note-on
+
+        // Before any quarter-frame the linear counter is still zero:
+        // the length lock is open, the linear lock is not.
+        assert_eq!(apu.triangle.sample(44_100.0), 0, "linear lock closed");
+        run(&mut apu, 7457); // the first quarter-frame beat
+        let mut sang = false;
+        for _ in 0..100 {
+            sang |= apu.triangle.sample(44_100.0) > 0;
+        }
+        assert!(sang, "both locks open, still silent");
+
+        // A note-off the FamiTone way: reload value zero.
+        apu.write(0x4008, 0x80);
+        run(&mut apu, 29830);
+        assert_eq!(apu.triangle.sample(44_100.0), 0, "note-off ignored");
+    }
+
+    #[test]
+    fn the_triangle_walks_all_thirty_two_steps() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0100);
+        apu.write(0x4008, 0xFF);
+        apu.write(0x400A, 70);
+        apu.write(0x400B, 0);
+        run(&mut apu, 7457);
+
+        let mut seen = [false; 16];
+        for _ in 0..1000 {
+            seen[apu.triangle.sample(44_100.0) as usize] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "some staircase level missing");
+    }
+
+    #[test]
+    fn the_noise_register_ticks_like_the_hardware() {
+        let mut noise = Noise::new();
+        // Mode 1 turns the register into a 93-step loop; walk one
+        // full loop and land back at the seed.
+        noise.mode = true;
+        let seed = noise.lfsr;
+        for _ in 0..93 {
+            noise.shift();
+        }
+        assert_eq!(noise.lfsr, seed, "mode 1 is a 93-step pattern");
+
+        // Mode 0 must NOT close after 93 — its period is 32,767.
+        noise.mode = false;
+        noise.lfsr = 1;
+        for _ in 0..93 {
+            noise.shift();
+        }
+        assert_ne!(noise.lfsr, 1, "mode 0 closed far too soon");
+    }
+
+    #[test]
+    fn reading_status_clears_the_conductors_irq() {
+        let mut apu = Apu::new();
+        run(&mut apu, 29830);
+        let first = apu.read_status();
+        assert_ne!(first & 0b0100_0000, 0, "the sequence's end raises it");
+        let second = apu.read_status();
+        assert_eq!(second & 0b0100_0000, 0, "and reading clears it");
+    }
+
+    #[test]
+    fn the_inhibit_bit_silences_the_conductor() {
+        let mut apu = Apu::new();
+        apu.write(0x4017, 0b0100_0000);
+        run(&mut apu, 29830 * 3);
+        assert_eq!(apu.read_status() & 0b0100_0000, 0, "inhibited IRQ fired");
+    }
+
+    #[test]
+    fn a_4017_write_restarts_the_sequence_a_moment_later() {
+        let mut apu = Apu::new();
+        // Get near the first beat, then restart: the sequence starts
+        // over — three cycles late, because the write landed on an
+        // APU cycle (four, had it landed between two).
+        run(&mut apu, 7000);
+        apu.write(0x4017, 0);
+        run(&mut apu, 1000);
+        assert_eq!(apu.frame.cycle, 997, "restart was not deferred by 3");
+    }
+
+    #[test]
+    fn the_five_step_bit_clocks_everything_immediately() {
+        let mut apu = Apu::new();
+        apu.write(0x4015, 0b0001);
+        apu.write(0x4000, 0b0001_1111); // halt off
+        apu.write(0x4003, 0b1111_1000); // length index 31: thirty
+
+        // No conductor beat has happened — but the 5-step bit brings
+        // its own: one write, and thirty is already twenty-nine.
+        apu.write(0x4017, 0b1000_0000);
+        assert_eq!(apu.pulse1.length.counter, 29, "no immediate clock");
+    }
+
+    #[test]
+    fn the_sampler_asks_the_moment_its_buffer_is_empty() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 2); // sample at $C000 + 2 x 64
+        apu.write(0x4013, 1); // 17 bytes
+        apu.write(0x4015, 0b1_0000);
+
+        // The request surfaces a couple of cycles later — parity
+        // manners — and names the sample's first address.
+        assert_eq!(apu.dmc_fetch(), None, "asked before the delay ran out");
+        run(&mut apu, 3);
+        assert_eq!(apu.dmc_fetch(), Some(0xC080));
+    }
+
+    #[test]
+    fn each_bit_nudges_the_level_by_two() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0); // "zero" still means one byte
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+        apu.dmc_supply(0b1111_1111); // eight steps up
+
+        // The output unit must first shift out the eight silent bits
+        // it woke up with; only then does the byte load and nudge the
+        // level up 2 x 8 = 16 over the next eight periods.
+        run(&mut apu, 428 * 18);
+        assert_eq!(apu.dmc.level, 16);
+    }
+
+    #[test]
+    fn the_level_never_leaves_its_seven_bits() {
+        let mut apu = Apu::new();
+        apu.write(0x4011, 0x7E); // near the top
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0);
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+        apu.dmc_supply(0xFF); // eight more ups
+        run(&mut apu, 428 * 18);
+        assert!(apu.dmc.level <= 0x7F, "the DAC is seven bits wide");
+    }
+
+    #[test]
+    fn a_finished_sample_raises_the_irq_and_4015_reports_it() {
+        let mut apu = Apu::new();
+        apu.write(0x4010, 0b1000_0000); // IRQ on, no loop
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 0); // one byte
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        let address = apu.dmc_fetch().unwrap();
+        apu.dmc_supply(0x00);
+        assert_eq!(address, 0xC000);
+        assert_ne!(apu.read_status() & 0b1000_0000, 0, "the sample ended");
+
+        // Writing $4015 clears the sampler's IRQ — that is the
+        // acknowledgement games use.
+        apu.write(0x4015, 0);
+        assert_eq!(apu.read_status() & 0b1000_0000, 0);
+    }
+
+    #[test]
+    fn a_byte_for_a_cancelled_sample_changes_nothing() {
+        let mut apu = Apu::new();
+        apu.write(0x4012, 0);
+        apu.write(0x4013, 1);
+        apu.write(0x4015, 0b1_0000);
+        run(&mut apu, 3);
+        apu.dmc_fetch();
+
+        // The game calls the sample off while the DMA is in flight.
+        apu.write(0x4015, 0);
+        apu.dmc_supply(0xAA);
+
+        // The late byte must not resurrect it: a $4015 read that
+        // says "still playing" here would say it forever.
+        assert_eq!(apu.read_status() & 0b1_0000, 0, "a ghost sample plays on");
+    }
+
+    #[test]
+    fn the_filter_unparks_the_speaker() {
+        // A steady level is exactly what the mixer emits mid-note.
+        // The high-passes must walk it back to zero — no parked cone,
+        // no thump.
+        let mut filter = OutputFilter::new();
+        let mut last = 1.0;
+        for _ in 0..44_100 {
+            last = filter.process(0.5, 44_100.0);
+        }
+        assert!(last.abs() < 0.001, "DC survived: {last}");
+    }
+
+    #[test]
+    fn the_filter_lets_the_music_through() {
+        // A 1 kHz wobble sits squarely between the corners and must
+        // keep most of its size.
+        let mut filter = OutputFilter::new();
+        let mut peak: f32 = 0.0;
+        for n in 0..44_100 {
+            let t = n as f32 / 44_100.0;
+            let out = filter.process((2.0 * std::f32::consts::PI * 1000.0 * t).sin(), 44_100.0);
+            if n > 22_050 {
+                peak = peak.max(out.abs());
+            }
+        }
+        assert!(peak > 0.8, "the tone was crushed to {peak}");
+    }
 }

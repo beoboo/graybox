@@ -50,6 +50,7 @@ pub struct Cartridge {
     pub chr0: u8,
     pub chr1: u8,
     pub prg: u8,
+
     /// MMC3's bank plumbing: which register the next $8001 write
     /// fills (plus the two mode bits riding above), and the eight
     /// registers themselves.
@@ -111,11 +112,7 @@ impl Cartridge {
             mapper,
             vertical_mirroring,
             // A file with no CHR ROM gets a blank album to draw in.
-            chr_ram: if chr_size == 0 {
-                vec![0; 8 * 1024]
-            } else {
-                Vec::new()
-            },
+            chr_ram: if chr_size == 0 { vec![0; 8 * 1024] } else { Vec::new() },
             prg_ram: vec![0; 8 * 1024],
             prg_bank: 0,
             chr_bank: 0,
@@ -135,7 +132,6 @@ impl Cartridge {
             a12_was_low: Cell::new(true),
         })
     }
-
     /// Read from PRG as the CPU sees it, through whichever board is
     /// in the slot. NROM's modulo survives as the simplest case; the
     /// switchers choose which 16 KiB stands where.
@@ -277,11 +273,7 @@ impl Cartridge {
             1 => {
                 if self.control & 0b1_0000 != 0 {
                     // 4 KiB halves, chosen separately.
-                    let bank = if address < 0x1000 {
-                        self.chr0
-                    } else {
-                        self.chr1
-                    };
+                    let bank = if address < 0x1000 { self.chr0 } else { self.chr1 };
                     bank as usize * 4 * 1024 + (address & 0x0FFF)
                 } else {
                     (self.chr0 as usize & !1) * 4 * 1024 + address
@@ -305,7 +297,6 @@ impl Cartridge {
                     bank * 1024 + (a & 0x03FF)
                 }
             }
-
             _ => address,
         };
         self.chr_rom[index % self.chr_rom.len()]
@@ -519,13 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_album_accepts_ink() {
-        let mut cartridge = Cartridge::load(&fake_rom(1, 0)).unwrap();
-        assert_eq!(cartridge.chr_ram.len(), 8 * 1024);
-        cartridge.write_chr(0x0123, 0x77);
-        assert_eq!(cartridge.read_chr(0x0123), 0x77);
-    }
-    #[test]
     fn mmc3_places_quarters_and_bolts_the_back() {
         let mut cartridge = switcher(4, 4); // eight 8 KiB quarters
         cartridge.write_prg(0x8000, 6); // select R6
@@ -561,5 +545,33 @@ mod tests {
         // Disarming apologizes for the waiting IRQ.
         cartridge.write_prg(0xE000, 0);
         assert!(!cartridge.irq_asserted());
+    }
+
+    #[test]
+    fn a_port_write_clocks_a12_on_the_stepped_address() {
+        // mmc3_test's 3-A12_clocking card, pinned as a unit: a $2007
+        // write aimed at pattern space steps the port, and the board
+        // must see the address the port stepped TO — the rise lives
+        // after the step, on both of the write's paths.
+        use crate::cpu::Cpu;
+
+        let mut cpu = Cpu::new(switcher(4, 2));
+        cpu.bus.cartridge.irq_counter.set(3);
+
+        // Aim the port one step below the rise...
+        cpu.write(0x2006, 0x0F);
+        cpu.write(0x2006, 0xFF);
+        // ...and let the write's own step carry A12 up to $1000.
+        cpu.write(0x2007, 0x42);
+
+        assert_eq!(cpu.bus.cartridge.irq_counter.get(), 2);
+    }
+
+    #[test]
+    fn a_blank_album_accepts_ink() {
+        let mut cartridge = Cartridge::load(&fake_rom(1, 0)).unwrap();
+        assert_eq!(cartridge.chr_ram.len(), 8 * 1024);
+        cartridge.write_chr(0x0123, 0x77);
+        assert_eq!(cartridge.read_chr(0x0123), 0x77);
     }
 }

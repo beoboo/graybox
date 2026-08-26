@@ -9,3 +9,6 @@ minifb = "0.27"
 
 # cpal ("cross-platform audio library") opens the speaker the same way.
 cpal = "0.15"
+
+# The reader's crate is standalone; so is this snapshot.
+[workspace]

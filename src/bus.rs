@@ -1,11 +1,12 @@
 //! The bus — the wiring that decides which chip answers each address.
 
+use std::cell::Cell;
+
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::clock::Clock;
 use crate::controller::Controller;
 use crate::ppu::Ppu;
-use std::cell::Cell;
 
 /// Everything on the far side of the CPU's read and write lines.
 pub struct Bus {
@@ -83,6 +84,7 @@ impl Bus {
             cartridge,
         }
     }
+
     /// One address in, one byte out — and whatever comes out lingers
     /// on the wire, because that is what wires do.
     pub fn read(&self, address: u16) -> u8 {
@@ -118,7 +120,9 @@ impl Bus {
         value
     }
 
-    pub fn read_decoded(&self, address: u16) -> u8 {
+    /// One address in, one byte out — from whichever chip lives there.
+    /// (A `..=` pattern matches a whole range of values at once.)
+    fn read_decoded(&self, address: u16) -> u8 {
         match address {
             // The console's RAM — and its three echoes. The board only
             // decodes enough address wires to tell 2 KiB apart, so the
@@ -166,7 +170,7 @@ impl Bus {
 
             // The sound chip's one readable register.
             0x4015 => self.apu.read_status(),
-
+            // The first controller: one button per read.
             0x4016 => {
                 // A sampler DMA that landed earlier in this very
                 // instruction re-clocked the port: the bit it read
@@ -184,6 +188,7 @@ impl Bus {
             // top bits the wire's memory.
             0x4017 => self.open_bus.get() & 0xE0,
 
+            // Sound registers, and the second controller port. Nobody.
             // Write-only sound registers: nothing answers, so the
             // wire's memory does.
             0x4000..=0x401F => self.open_bus.get(),
@@ -231,8 +236,8 @@ impl Bus {
                         self.ppu.step_address();
                     } else {
                         self.ppu.write_data(value);
-                        self.cartridge.watch_address(self.ppu.data_address());
                     }
+                    self.cartridge.watch_address(self.ppu.data_address());
                 }
                 _ => {}
             },

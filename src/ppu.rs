@@ -24,8 +24,8 @@ pub fn decode_tile(chr: &[u8], tile: usize) -> [[u8; 8]; 8] {
     pixels
 }
 
-use crate::cartridge::{Cartridge, Mirroring};
 use std::cell::Cell;
+use crate::cartridge::{Cartridge, Mirroring};
 
 /// The picture chip's own state: its private memory and the handful of
 /// registers the CPU can reach through the bus.
@@ -227,11 +227,7 @@ impl Ppu {
     /// they simply don't exist on the chip.
     pub fn read_oam_data(&self) -> u8 {
         let value = self.oam[self.oam_addr as usize];
-        if self.oam_addr & 3 == 2 {
-            value & 0xE3
-        } else {
-            value
-        }
+        if self.oam_addr & 3 == 2 { value & 0xE3 } else { value }
     }
 
     /// A write to PPUADDR ($2006): half of an address — big half on
@@ -273,7 +269,6 @@ impl Ppu {
     pub fn data_address(&self) -> u16 {
         self.v.get() & 0x3FFF
     }
-
     /// The auto-step every PPUDATA access ends with: +1 normally, +32 —
     /// one screen-row down — when PPUCTRL asks for column order.
     pub fn step_address(&self) {
@@ -301,6 +296,7 @@ impl Ppu {
     /// disturbing them.
     pub fn read_data(&self, cart: &Cartridge) -> u8 {
         let address = self.v.get() & 0x3FFF;
+
         // The crayon box is the one tenant with no waiting room: a
         // palette read answers at once — while the buffer quietly
         // loads the nametable byte that lives UNDER the palette's
@@ -311,6 +307,7 @@ impl Ppu {
             self.step_address();
             return value;
         }
+
         let value = self.read_buffer.get();
 
         self.read_buffer.set(match address {
@@ -348,7 +345,8 @@ impl Ppu {
         // keep the nametable bits, then chop both coordinates to
         // blocks — the top three bits of coarse Y and of coarse X,
         // packed side by side.
-        let attribute_address = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        let attribute_address =
+            0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
         let attribute = self.vram[self.mirror(attribute_address)];
 
         // Inside the byte, two bits per 2x2-tile quadrant, as ever:
@@ -359,11 +357,7 @@ impl Ppu {
 
         // PPUCTRL bit 4 picks the background's half of the album:
         // sixteen bytes a tile, the high plane eight bytes in.
-        let table = if self.ctrl & 0b0001_0000 != 0 {
-            0x1000
-        } else {
-            0
-        };
+        let table = if self.ctrl & 0b0001_0000 != 0 { 0x1000 } else { 0 };
         let start = table + tile * 16 + ((v >> 12) & 0b111) as usize;
         self.next_pattern_low = cart.read_chr(start as u16);
         self.next_pattern_high = cart.read_chr(start as u16 + 8);
@@ -581,7 +575,8 @@ impl Ppu {
         let high = (self.shift_high >> tap) & 1;
         let value = ((high << 1) | low) as usize;
 
-        let palette = (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
+        let palette =
+            (((self.attr_high >> tap) & 1) << 1 | ((self.attr_low >> tap) & 1)) as usize;
 
         let crayon = if value == 0 {
             self.palette_ram[0]
@@ -701,11 +696,7 @@ impl Ppu {
         // sprites' half of the album, and a board that counts the
         // beam's errands is listening for exactly that.
         if dot == 257 {
-            let base = if self.ctrl & 0b0010_1000 != 0 {
-                0x1000
-            } else {
-                0
-            };
+            let base = if self.ctrl & 0b0010_1000 != 0 { 0x1000 } else { 0 };
             cart.read_chr(base);
         }
 
@@ -766,7 +757,8 @@ const ATTENUATION: f32 = 0.746;
 
 /// The two voltages a color's square wave swings between, by
 /// brightness: the low four are the trough, the high four the crest.
-const SIGNAL_LEVELS: [f32; 8] = [0.350, 0.518, 0.962, 1.550, 1.094, 1.506, 1.962, 1.962];
+const SIGNAL_LEVELS: [f32; 8] =
+    [0.350, 0.518, 0.962, 1.550, 1.094, 1.506, 1.962, 1.962];
 
 /// Whether sample `p` of the twelve falls in the half-cycle where
 /// `hue`'s wave is high. Twelve samples make one color cycle; a hue
@@ -834,11 +826,7 @@ fn decode_color(index: usize) -> u32 {
     // YIQ to RGB by the broadcast matrix, with the gamma bend a CRT
     // would have applied — skip it and everything washes out.
     let channel = |value: f32| -> u32 {
-        let bent = if value <= 0.0 {
-            0.0
-        } else {
-            value.powf(2.2 / 1.8)
-        };
+        let bent = if value <= 0.0 { 0.0 } else { value.powf(2.2 / 1.8) };
         (bent * 255.0).clamp(0.0, 255.0) as u32
     };
 
@@ -856,14 +844,14 @@ mod tests {
     /// is to be the answer key the signal decoding must reproduce,
     /// entry for entry.
     const SYSTEM_PALETTE: [u32; 64] = [
-        0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000, 0x272900,
-        0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000, 0xA0A0A0, 0x004FFF,
-        0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900, 0x5E6100, 0x208300, 0x009400,
-        0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000, 0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF,
-        0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00, 0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA,
-        0x3C3C3C, 0x000000, 0x000000, 0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA,
-        0xFFBBB1, 0xFDCD82, 0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000,
-        0x000000,
+    0x525252, 0x001E94, 0x0907C2, 0x3100BD, 0x580086, 0x6F0036, 0x6C0000, 0x501000,
+    0x272900, 0x023F00, 0x004B00, 0x004700, 0x003646, 0x000000, 0x000000, 0x000000,
+    0xA0A0A0, 0x004FFF, 0x2C2AFF, 0x6D0FFF, 0xA905ED, 0xCB0775, 0xC61909, 0x9D3900,
+    0x5E6100, 0x208300, 0x009400, 0x008F1A, 0x00758D, 0x000000, 0x000000, 0x000000,
+    0xFEFEFE, 0x3EA4FF, 0x7B78FF, 0xC656FF, 0xFF46FF, 0xFF4ACE, 0xFF634C, 0xFB8B00,
+    0xB5B800, 0x6BDE00, 0x34F205, 0x1AEC63, 0x1ECFEA, 0x3C3C3C, 0x000000, 0x000000,
+    0xFEFEFE, 0xAAD8FF, 0xC6C5FF, 0xE7B5FF, 0xFFADFF, 0xFFB0EA, 0xFFBBB1, 0xFDCD82,
+    0xDFE16A, 0xBFF16D, 0xA5F98A, 0x97F7BC, 0x99EBF6, 0xA9A9A9, 0x000000, 0x000000,
     ];
 
     #[test]
