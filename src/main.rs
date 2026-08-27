@@ -14,16 +14,25 @@ mod controller;
 mod apu;
 // The metronome the whole machine marches to.
 mod clock;
+// The debugger's typeface.
+mod font;
+// The picture the window shows.
+mod canvas;
+// Stopping the machine, and looking inside.
+mod debugger;
 
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 // The speaker's plumbing: a queue of samples, shared with the audio
 // thread behind a lock.
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use canvas::Canvas;
+use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
-use cartridge::Cartridge;
+use debugger::{Debugger, Step};
+use font::Font;
 
 /// The NES picture is exactly 256 pixels wide...
 const WIDTH: usize = 256;
@@ -35,14 +44,23 @@ fn main() {
     // One path on the command line boots a machine — and now we KEEP it.
     // Two paths run the grader instead.
     let args: Vec<String> = std::env::args().collect();
-    let mut machine = match args.len() {
-        2 => Some(boot_rom(&args[1])),
-        3 => {
-            nestest_diff(&args[1], &args[2]);
+    // The command line, sorted: file paths first, then the switches
+    // that ask for a picture instead of a window.
+    let (paths, options) = parse_args(&args[1..]);
+    let mut machine = match paths.len() {
+        1 => Some(boot_rom(&paths[0])),
+        2 => {
+            nestest_diff(&paths[0], &paths[1]);
             None
         }
         _ => None,
     };
+
+    // A picture instead of a window: run, paint, write, and leave.
+    if let (Some(cpu), Some(out)) = (machine.as_mut(), &options.out) {
+        headless(cpu, &options, out);
+        return;
+    }
 
     // The frame buffer: one number for every pixel on our screen.
     // 0 means black, so right now this is a picture of nothing.
@@ -58,6 +76,10 @@ fn main() {
     // Open the speaker. `None` — no audio device, or a grumpy one —
     // just means a silent movie; the game must still run.
     let audio = start_audio();
+
+    // The debugger and its typeface, ready before the first frame.
+    let font = load_font();
+    let mut debugger = Debugger::new();
 
     // Ask the operating system for a window. `Scale::X2` doubles every pixel,
     // because 256x240 is tiny on a modern screen.
@@ -78,6 +100,23 @@ fn main() {
     // Show the buffer, over and over, until the window is closed
     // or Esc is pressed.
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Tab opens the debugger and stops the machine, or closes it and
+        // lets the machine go; the step keys move it while it is open.
+        // Tab and F count once per press. N and L keep counting while
+        // held, so holding one runs the machine in slow motion.
+        if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+            debugger.toggle();
+        }
+        if window.is_key_pressed(Key::N, KeyRepeat::Yes) {
+            debugger.step(Step::Instruction);
+        }
+        if window.is_key_pressed(Key::L, KeyRepeat::Yes) {
+            debugger.step(Step::Scanline);
+        }
+        if window.is_key_pressed(Key::F, KeyRepeat::No) {
+            debugger.step(Step::Frame);
+        }
+
         if let Some(cpu) = &mut machine {
             // The keyboard becomes the controller — one key per
             // button, in the console's own order: A, B, Select,
@@ -102,16 +141,10 @@ fn main() {
 
             cpu.bus.controller.buttons = buttons;
 
-            // One trip around this loop is one frame, measured by the
-            // machine's own metronome. The vblank flag and the NMI are
-            // the clock's business, handled on their exact dots inside
-            // `step` — this loop only asks when the frame is over.
-            let frame = cpu.bus.clock.frame;
-            while cpu.bus.clock.frame == frame {
-                if !cpu.step() {
-                    break; // a jammed machine keeps its last picture
-                }
-            }
+            // How far the machine moves is the debugger's call: a whole
+            // frame while it runs, one step when asked, nothing at all
+            // while it stands still.
+            debugger.run(cpu);
 
             // The picture was painted during the frame, one dot at a
             // time; the window just collects it.
@@ -124,8 +157,12 @@ fn main() {
             }
         }
 
+        // What the window shows: the picture alone, doubled — or, with
+        // the debugger open, the picture at true size beside its panels.
+        // The window keeps its size; the buffer changes shape to fit.
+        let canvas = compose(&buffer, machine.as_ref(), &debugger, &font);
         window
-            .update_with_buffer(&buffer, WIDTH, HEIGHT)
+            .update_with_buffer(&canvas.pixels, canvas.width, canvas.height)
             .expect("could not draw to the window");
     }
 }
@@ -257,7 +294,11 @@ fn start_audio() -> Option<Speaker> {
         .ok()?;
 
     stream.play().ok()?;
-    Some(Speaker { _stream: stream, queue, sample_rate })
+    Some(Speaker {
+        _stream: stream,
+        queue,
+        sample_rate,
+    })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden
@@ -299,4 +340,151 @@ fn nestest_diff(rom_path: &str, log_path: &str) {
         cpu.step();
     }
     println!("all {matched} lines matched");
+}
+
+/// The debugger's typeface, `roms/font8x8.bin`. Without it there is no
+/// text to draw, so its absence is worth stopping for.
+fn load_font() -> Font {
+    Font::load("roms/font8x8.bin").unwrap_or_else(|why| {
+        eprintln!("{why}");
+        eprintln!("the debugger needs font8x8.bin in roms/");
+        std::process::exit(1);
+    })
+}
+
+/// The picture for the window: the game's frame alone, or — with the
+/// debugger open — the frame at true size in the top-left corner, and
+/// the panels beside it.
+fn compose(frame: &[u32], cpu: Option<&Cpu>, debugger: &Debugger, font: &Font) -> Canvas {
+    match cpu {
+        Some(cpu) if debugger.open => {
+            let mut canvas = Canvas::new(WIDTH * 2, HEIGHT * 2);
+            canvas.fill(0, 0, WIDTH * 2, HEIGHT * 2, debugger::PANEL);
+            canvas.blit(0, 0, WIDTH, frame);
+            debugger.paint_registers(&mut canvas, font, cpu, WIDTH + 8, 8);
+            canvas
+        }
+        _ => {
+            let mut canvas = Canvas::new(WIDTH, HEIGHT);
+            canvas.blit(0, 0, WIDTH, frame);
+            canvas
+        }
+    }
+}
+
+/// Run without a window: the frames asked for, then one picture — the
+/// game alone, or beside the debugger's panels — written to `out` as a
+/// PPM file.
+fn headless(cpu: &mut Cpu, options: &Options, out: &str) {
+    let font = load_font();
+    let mut debugger = Debugger::new();
+    for _ in 0..options.frames {
+        debugger.run(cpu);
+    }
+    if options.debug {
+        debugger.toggle();
+    }
+
+    // Stopping partway down the next frame: open the debugger if it is
+    // not, then step a scanline at a time until the beam arrives.
+    if let Some(line) = options.line {
+        if !debugger.open {
+            debugger.toggle();
+        }
+        while cpu.bus.clock.scanline != line {
+            debugger.step(Step::Scanline);
+            debugger.run(cpu);
+        }
+    }
+
+    let machine: &Cpu = cpu;
+    let canvas = compose(&machine.bus.ppu.frame, Some(machine), &debugger, &font);
+    std::fs::write(out, write_ppm(&canvas)).expect("could not write the picture");
+    println!("  {} frames, then {out}", options.frames);
+}
+
+/// A canvas as a PPM file: a three-line header, then one byte per color
+/// part — red, green, blue — row after row. The plainest picture format
+/// there is, which is why no library is needed to write it.
+fn write_ppm(canvas: &Canvas) -> Vec<u8> {
+    let mut file = format!("P6\n{} {}\n255\n", canvas.width, canvas.height).into_bytes();
+    for &pixel in &canvas.pixels {
+        file.extend([(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]);
+    }
+    file
+}
+/// The switches a picture needs. Without them the window opens as always.
+struct Options {
+    /// Frames to run before the picture is taken.
+    frames: u64,
+    /// Where to write the picture; `None` means open a window instead.
+    out: Option<String>,
+    /// Take the picture with the debugger's panels open.
+    debug: bool,
+    /// Stop the beam on this scanline of the frame after the last — the
+    /// picture half painted, the way the debugger shows it.
+    line: Option<u16>,
+}
+
+/// Split the command line into file paths and switches — `--frames N`,
+/// `--out FILE`, `--debug`, `--line N`. Anything else is a path.
+fn parse_args(args: &[String]) -> (Vec<String>, Options) {
+    let mut paths = Vec::new();
+    let mut options = Options {
+        frames: 60,
+        out: None,
+        debug: false,
+        line: None,
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--frames" => {
+                options.frames = args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(60);
+                i += 1;
+            }
+            "--out" => {
+                options.out = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--debug" => options.debug = true,
+            "--line" => {
+                options.line = args.get(i + 1).and_then(|n| n.parse().ok());
+                i += 1;
+            }
+            path => paths.push(path.to_string()),
+        }
+        i += 1;
+    }
+    (paths, options)
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    #[test]
+    fn a_ppm_is_a_header_and_three_bytes_a_pixel() {
+        let mut canvas = Canvas::new(2, 1);
+        canvas.pixels[1] = 0x00AB_CDEF;
+        let file = write_ppm(&canvas);
+        assert!(file.starts_with(b"P6\n2 1\n255\n"));
+        assert_eq!(&file[11..], &[0, 0, 0, 0xAB, 0xCD, 0xEF]);
+    }
+
+    #[test]
+    fn switches_come_out_of_the_paths() {
+        let args: Vec<String> =
+            ["game.nes", "--frames", "120", "--debug", "--line", "100", "--out", "shot.ppm"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let (paths, options) = parse_args(&args);
+        assert_eq!(paths, ["game.nes"]);
+        assert_eq!(options.frames, 120);
+        assert!(options.debug);
+        assert_eq!(options.line, Some(100));
+        assert_eq!(options.out.as_deref(), Some("shot.ppm"));
+    }
 }
