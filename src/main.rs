@@ -91,7 +91,7 @@ fn main() {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Tab opens the debugger and stops the machine, or closes it and
         // lets the machine go; the step keys move it while it is open.
-        // Tab and F count once per press. N and L keep counting while
+        // Tab counts once per press. The step keys keep counting while
         // held, so holding one runs the machine in slow motion.
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
             debugger.toggle();
@@ -102,7 +102,7 @@ fn main() {
         if window.is_key_pressed(Key::L, KeyRepeat::Yes) {
             debugger.step(Step::Scanline);
         }
-        if window.is_key_pressed(Key::F, KeyRepeat::No) {
+        if window.is_key_pressed(Key::F, KeyRepeat::Yes) {
             debugger.step(Step::Frame);
         }
 
