@@ -84,8 +84,8 @@ impl Debugger {
     }
 
     /// The registers panel, its top-left corner at (x, y): the CPU's
-    /// pockets, the flags spelled out over their bits, where the beam is,
-    /// and the keys.
+    /// pockets, the flags spelled out over their bits, and where the beam
+    /// is.
     pub fn paint_registers(&self, canvas: &mut Canvas, font: &Font, cpu: &Cpu, x: usize, y: usize) {
         // Ten pixels a line: eight of glyph, two of air.
         let mut line = |row: usize, text: &str, color: u32| {
@@ -100,13 +100,15 @@ impl Debugger {
         let clock = &cpu.bus.clock;
         line(5, &format!("frame {}", clock.frame), INK);
         line(6, &format!("line {}  dot {}", clock.scanline, clock.dot), INK);
+    }
 
-        line(8, "Tab run/stop  N step", DIM);
-        line(9, "L scanline    F frame", DIM);
+    /// The keys, two dim lines wherever there is room for them.
+    pub fn paint_keys(&self, canvas: &mut Canvas, font: &Font, x: usize, y: usize) {
+        canvas.text(font, x, y, "Tab run/stop  N step", DIM);
+        canvas.text(font, x, y + 10, "L scanline    F frame", DIM);
     }
 
 }
-
 
 /// Run until the clock's frame counter moves — the loop `main` used to
 /// own. A jammed machine keeps its last picture.

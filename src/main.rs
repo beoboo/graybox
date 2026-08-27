@@ -27,10 +27,10 @@ use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use canvas::Canvas;
-use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
+use cartridge::Cartridge;
+use canvas::Canvas;
 use debugger::{Debugger, Step};
 use font::Font;
 
@@ -81,21 +81,10 @@ fn main() {
     let font = load_font();
     let mut debugger = Debugger::new();
 
-    // Ask the operating system for a window. `Scale::X2` doubles every pixel,
-    // because 256x240 is tiny on a modern screen.
-    let mut window = Window::new(
-        "graybox",
-        WIDTH,
-        HEIGHT,
-        WindowOptions {
-            scale: Scale::X2,
-            ..WindowOptions::default()
-        },
-    )
-    .expect("could not open a window");
-
-    // A real NES shows 60 pictures every second. So will we.
-    window.set_target_fps(60);
+    // The window is as big as the picture it shows. That changes when
+    // the debugger opens, so the size is remembered to notice.
+    let mut window = open_window(WIDTH, HEIGHT);
+    let mut shown = (WIDTH, HEIGHT);
 
     // Show the buffer, over and over, until the window is closed
     // or Esc is pressed.
@@ -157,10 +146,17 @@ fn main() {
             }
         }
 
-        // What the window shows: the picture alone, doubled — or, with
-        // the debugger open, the picture at true size beside its panels.
-        // The window keeps its size; the buffer changes shape to fit.
+        // What the window shows: the picture alone, or the picture with
+        // the debugger's sidebar. A window cannot change size once it is
+        // open, so a canvas of a new shape gets a new window, opened
+        // where the old one stood.
         let canvas = compose(&buffer, machine.as_ref(), &debugger, &font);
+        if (canvas.width, canvas.height) != shown {
+            let (x, y) = window.get_position();
+            window = open_window(canvas.width, canvas.height);
+            window.set_position(x, y);
+            shown = (canvas.width, canvas.height);
+        }
         window
             .update_with_buffer(&canvas.pixels, canvas.width, canvas.height)
             .expect("could not draw to the window");
@@ -294,11 +290,7 @@ fn start_audio() -> Option<Speaker> {
         .ok()?;
 
     stream.play().ok()?;
-    Some(Speaker {
-        _stream: stream,
-        queue,
-        sample_rate,
-    })
+    Some(Speaker { _stream: stream, queue, sample_rate })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden
@@ -342,26 +334,48 @@ fn nestest_diff(rom_path: &str, log_path: &str) {
     println!("all {matched} lines matched");
 }
 
-/// The debugger's typeface, `roms/font8x8.bin`. Without it there is no
+/// The debugger's typeface, `fonts/font8x8.bin`. Without it there is no
 /// text to draw, so its absence is worth stopping for.
 fn load_font() -> Font {
-    Font::load("roms/font8x8.bin").unwrap_or_else(|why| {
+    Font::load("fonts/font8x8.bin").unwrap_or_else(|why| {
         eprintln!("{why}");
-        eprintln!("the debugger needs font8x8.bin in roms/");
+        eprintln!("the debugger needs font8x8.bin in fonts/");
         std::process::exit(1);
     })
 }
 
+/// Ask the operating system for a window of `width` by `height` pixels.
+/// `Scale::X2` doubles every pixel, because 256x240 is tiny on a modern
+/// screen; a real NES shows 60 pictures every second, and so will we.
+fn open_window(width: usize, height: usize) -> Window {
+    let mut window = Window::new(
+        "graybox",
+        width,
+        height,
+        WindowOptions {
+            scale: Scale::X2,
+            ..WindowOptions::default()
+        },
+    )
+    .expect("could not open a window");
+    window.set_target_fps(60);
+    window
+}
+
+/// How much room the debugger's panels get beside the picture: a gutter,
+/// twenty-eight characters of text, a margin.
+const SIDEBAR: usize = 8 + 28 * 8 + 8;
+
 /// The picture for the window: the game's frame alone, or — with the
-/// debugger open — the frame at true size in the top-left corner, and
-/// the panels beside it.
+/// debugger open — the frame with a sidebar for the panels.
 fn compose(frame: &[u32], cpu: Option<&Cpu>, debugger: &Debugger, font: &Font) -> Canvas {
     match cpu {
         Some(cpu) if debugger.open => {
-            let mut canvas = Canvas::new(WIDTH * 2, HEIGHT * 2);
-            canvas.fill(0, 0, WIDTH * 2, HEIGHT * 2, debugger::PANEL);
+            let mut canvas = Canvas::new(WIDTH + SIDEBAR, HEIGHT);
+            canvas.fill(WIDTH, 0, SIDEBAR, HEIGHT, debugger::PANEL);
             canvas.blit(0, 0, WIDTH, frame);
-            debugger.paint_registers(&mut canvas, font, cpu, WIDTH + 8, 8);
+            debugger.paint_registers(&mut canvas, font, cpu, WIDTH + 8, 4);
+            debugger.paint_keys(&mut canvas, font, WIDTH + 8, HEIGHT - 24);
             canvas
         }
         _ => {
@@ -413,6 +427,7 @@ fn write_ppm(canvas: &Canvas) -> Vec<u8> {
     }
     file
 }
+
 /// The switches a picture needs. Without them the window opens as always.
 struct Options {
     /// Frames to run before the picture is taken.
@@ -430,12 +445,7 @@ struct Options {
 /// `--out FILE`, `--debug`, `--line N`. Anything else is a path.
 fn parse_args(args: &[String]) -> (Vec<String>, Options) {
     let mut paths = Vec::new();
-    let mut options = Options {
-        frames: 60,
-        out: None,
-        debug: false,
-        line: None,
-    };
+    let mut options = Options { frames: 60, out: None, debug: false, line: None };
 
     let mut i = 0;
     while i < args.len() {

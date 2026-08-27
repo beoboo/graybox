@@ -55,7 +55,6 @@ impl Canvas {
             }
         }
     }
-
 }
 
 #[cfg(test)]
