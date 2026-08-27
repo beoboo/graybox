@@ -20,6 +20,8 @@ mod font;
 mod canvas;
 // Stopping the machine, and looking inside.
 mod debugger;
+// Bytes back into instructions.
+mod disasm;
 
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 // The speaker's plumbing: a queue of samples, shared with the audio
@@ -27,10 +29,10 @@ use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use canvas::Canvas;
+use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
-use cartridge::Cartridge;
-use canvas::Canvas;
 use debugger::{Debugger, Step};
 use font::Font;
 
@@ -290,7 +292,11 @@ fn start_audio() -> Option<Speaker> {
         .ok()?;
 
     stream.play().ok()?;
-    Some(Speaker { _stream: stream, queue, sample_rate })
+    Some(Speaker {
+        _stream: stream,
+        queue,
+        sample_rate,
+    })
 }
 
 /// Run nestest in automation mode and grade our CPU against a golden
@@ -375,7 +381,9 @@ fn compose(frame: &[u32], cpu: Option<&Cpu>, debugger: &Debugger, font: &Font) -
             canvas.fill(WIDTH, 0, SIDEBAR, HEIGHT, debugger::PANEL);
             canvas.blit(0, 0, WIDTH, frame);
             debugger.paint_registers(&mut canvas, font, cpu, WIDTH + 8, 4);
+            debugger.paint_listing(&mut canvas, font, cpu, WIDTH + 8, 78);
             debugger.paint_keys(&mut canvas, font, WIDTH + 8, HEIGHT - 24);
+
             canvas
         }
         _ => {
@@ -445,7 +453,12 @@ struct Options {
 /// `--out FILE`, `--debug`, `--line N`. Anything else is a path.
 fn parse_args(args: &[String]) -> (Vec<String>, Options) {
     let mut paths = Vec::new();
-    let mut options = Options { frames: 60, out: None, debug: false, line: None };
+    let mut options = Options {
+        frames: 60,
+        out: None,
+        debug: false,
+        line: None,
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -485,11 +498,12 @@ mod picture_tests {
 
     #[test]
     fn switches_come_out_of_the_paths() {
-        let args: Vec<String> =
-            ["game.nes", "--frames", "120", "--debug", "--line", "100", "--out", "shot.ppm"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let args: Vec<String> = [
+            "game.nes", "--frames", "120", "--debug", "--line", "100", "--out", "shot.ppm",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let (paths, options) = parse_args(&args);
         assert_eq!(paths, ["game.nes"]);
         assert_eq!(options.frames, 120);

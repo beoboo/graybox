@@ -1,8 +1,8 @@
 //! The 6502 CPU — the brain of the NES.
 
-use std::cell::Cell;
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
+use std::cell::Cell;
 
 /// The CPU: a handful of small "pockets" (registers) and the memory it
 /// reads and writes.
@@ -471,9 +471,7 @@ impl Cpu {
             0x28 => {
                 let value = self.pull();
                 self.pending_i = Some(value & FLAG_INTERRUPT_DISABLE != 0);
-                self.status = (value | 0b0010_0000)
-                    & !0b0001_0000
-                    & !FLAG_INTERRUPT_DISABLE
+                self.status = (value | 0b0010_0000) & !0b0001_0000 & !FLAG_INTERRUPT_DISABLE
                     | (self.status & FLAG_INTERRUPT_DISABLE);
             }
 
@@ -696,8 +694,9 @@ impl Cpu {
             // 6502 until the reset button. Ours stops politely instead,
             // and the test programs end on it.
             // Eleven brothers jam identically.
-            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2
-            | 0xD2 | 0xF2 => return false,
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
+                return false;
+            }
 
             // ---- The unofficial army ----
             // NOPs of every shape: they do nothing, but they do it
@@ -740,41 +739,132 @@ impl Cpu {
             // The fused rewrites: DCP, ISB, SLO, RLA, SRE, RRA —
             // each an official rewrite plus an official A-operation,
             // sharing one opcode by decoding accident.
-            0xC7 => self.modify_then(AddressingMode::ZeroPage, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xD7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xCF => self.modify_then(AddressingMode::Absolute, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xDF => self.modify_then(AddressingMode::AbsoluteX, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xDB => self.modify_then(AddressingMode::AbsoluteY, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xC3 => self.modify_then(AddressingMode::IndirectX, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xD3 => self.modify_then(AddressingMode::IndirectY, Cpu::dec_value, |cpu, r| cpu.compare_value(cpu.a, r)),
-            0xE7 => self.modify_then(AddressingMode::ZeroPage, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xF7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xEF => self.modify_then(AddressingMode::Absolute, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xFF => self.modify_then(AddressingMode::AbsoluteX, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xFB => self.modify_then(AddressingMode::AbsoluteY, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xE3 => self.modify_then(AddressingMode::IndirectX, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0xF3 => self.modify_then(AddressingMode::IndirectY, Cpu::inc_value, |cpu, r| cpu.add_to_a(r ^ 0xFF)),
-            0x07 => self.modify_then(AddressingMode::ZeroPage, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x17 => self.modify_then(AddressingMode::ZeroPageX, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x0F => self.modify_then(AddressingMode::Absolute, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x1F => self.modify_then(AddressingMode::AbsoluteX, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x1B => self.modify_then(AddressingMode::AbsoluteY, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x03 => self.modify_then(AddressingMode::IndirectX, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x13 => self.modify_then(AddressingMode::IndirectY, Cpu::asl_value, |cpu, r| { cpu.a |= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x27 => self.modify_then(AddressingMode::ZeroPage, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x37 => self.modify_then(AddressingMode::ZeroPageX, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x2F => self.modify_then(AddressingMode::Absolute, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x3F => self.modify_then(AddressingMode::AbsoluteX, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x3B => self.modify_then(AddressingMode::AbsoluteY, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x23 => self.modify_then(AddressingMode::IndirectX, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x33 => self.modify_then(AddressingMode::IndirectY, Cpu::rol_value, |cpu, r| { cpu.a &= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x47 => self.modify_then(AddressingMode::ZeroPage, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x57 => self.modify_then(AddressingMode::ZeroPageX, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x4F => self.modify_then(AddressingMode::Absolute, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x5F => self.modify_then(AddressingMode::AbsoluteX, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x5B => self.modify_then(AddressingMode::AbsoluteY, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x43 => self.modify_then(AddressingMode::IndirectX, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
-            0x53 => self.modify_then(AddressingMode::IndirectY, Cpu::lsr_value, |cpu, r| { cpu.a ^= r; cpu.update_zero_and_negative(cpu.a); }),
+            0xC7 => self.modify_then(AddressingMode::ZeroPage, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xD7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xCF => self.modify_then(AddressingMode::Absolute, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xDF => self.modify_then(AddressingMode::AbsoluteX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xDB => self.modify_then(AddressingMode::AbsoluteY, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xC3 => self.modify_then(AddressingMode::IndirectX, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xD3 => self.modify_then(AddressingMode::IndirectY, Cpu::dec_value, |cpu, r| {
+                cpu.compare_value(cpu.a, r)
+            }),
+            0xE7 => self.modify_then(AddressingMode::ZeroPage, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xF7 => self.modify_then(AddressingMode::ZeroPageX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xEF => self.modify_then(AddressingMode::Absolute, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xFF => self.modify_then(AddressingMode::AbsoluteX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xFB => self.modify_then(AddressingMode::AbsoluteY, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xE3 => self.modify_then(AddressingMode::IndirectX, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0xF3 => self.modify_then(AddressingMode::IndirectY, Cpu::inc_value, |cpu, r| {
+                cpu.add_to_a(r ^ 0xFF)
+            }),
+            0x07 => self.modify_then(AddressingMode::ZeroPage, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x17 => self.modify_then(AddressingMode::ZeroPageX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x0F => self.modify_then(AddressingMode::Absolute, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x1F => self.modify_then(AddressingMode::AbsoluteX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x1B => self.modify_then(AddressingMode::AbsoluteY, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x03 => self.modify_then(AddressingMode::IndirectX, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x13 => self.modify_then(AddressingMode::IndirectY, Cpu::asl_value, |cpu, r| {
+                cpu.a |= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x27 => self.modify_then(AddressingMode::ZeroPage, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x37 => self.modify_then(AddressingMode::ZeroPageX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x2F => self.modify_then(AddressingMode::Absolute, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x3F => self.modify_then(AddressingMode::AbsoluteX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x3B => self.modify_then(AddressingMode::AbsoluteY, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x23 => self.modify_then(AddressingMode::IndirectX, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x33 => self.modify_then(AddressingMode::IndirectY, Cpu::rol_value, |cpu, r| {
+                cpu.a &= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x47 => self.modify_then(AddressingMode::ZeroPage, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x57 => self.modify_then(AddressingMode::ZeroPageX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x4F => self.modify_then(AddressingMode::Absolute, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x5F => self.modify_then(AddressingMode::AbsoluteX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x5B => self.modify_then(AddressingMode::AbsoluteY, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x43 => self.modify_then(AddressingMode::IndirectX, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
+            0x53 => self.modify_then(AddressingMode::IndirectY, Cpu::lsr_value, |cpu, r| {
+                cpu.a ^= r;
+                cpu.update_zero_and_negative(cpu.a);
+            }),
             0x67 => self.modify_then(AddressingMode::ZeroPage, Cpu::ror_value, Cpu::add_to_a),
             0x77 => self.modify_then(AddressingMode::ZeroPageX, Cpu::ror_value, Cpu::add_to_a),
             0x6F => self.modify_then(AddressingMode::Absolute, Cpu::ror_value, Cpu::add_to_a),
@@ -809,7 +899,11 @@ impl Cpu {
                 // bit 6 against bit 5.
                 let value = self.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
-                let carry_in = if self.status & FLAG_CARRY != 0 { 0x80 } else { 0 };
+                let carry_in = if self.status & FLAG_CARRY != 0 {
+                    0x80
+                } else {
+                    0
+                };
                 let result = ((self.a & value) >> 1) | carry_in;
                 self.a = result;
                 self.update_zero_and_negative(result);
@@ -869,7 +963,6 @@ impl Cpu {
                 self.sp = self.a & self.x;
                 self.strange_store(AddressingMode::AbsoluteY, self.a & self.x);
             }
-
         }
 
         // Bill the page-crossing surcharge, for the reads that met one.
@@ -937,9 +1030,7 @@ impl Cpu {
             self.nmi_pending.set(false);
             self.nmi();
             self.advance_clock(7);
-        } else if
-            take_irq
-        {
+        } else if take_irq {
             self.irq();
             self.advance_clock(7);
         }
@@ -1639,6 +1730,17 @@ impl Cpu {
             "{:04X}  {:<9} {}  A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}",
             self.pc, bytes, name, self.a, self.x, self.y, self.status, self.sp
         ))
+    }
+
+    /// Look at a byte without touching anything. RAM and the cartridge
+    /// answer; the chips' registers do not — a read of $2002 clears a
+    /// flag, and a listing must never do that behind the game's back.
+    pub fn peek(&self, address: u16) -> Option<u8> {
+        match address {
+            0x0000..=0x1FFF => Some(self.bus.ram[address as usize % 2048]),
+            0x8000..=0xFFFF => Some(self.bus.cartridge.read_prg(address)),
+            _ => None,
+        }
     }
 }
 
@@ -2544,7 +2646,11 @@ mod tests {
         cpu.bus.write(0x2001, 0b0000_1000);
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (2, 0, 0)
         );
 
@@ -2553,7 +2659,11 @@ mod tests {
         let mut cpu = Cpu::new(test_cartridge(&[]));
         cpu.advance_clock(59_561);
         assert_eq!(
-            (cpu.bus.clock.frame, cpu.bus.clock.scanline, cpu.bus.clock.dot),
+            (
+                cpu.bus.clock.frame,
+                cpu.bus.clock.scanline,
+                cpu.bus.clock.dot
+            ),
             (1, 261, 340)
         );
     }

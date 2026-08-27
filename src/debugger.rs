@@ -2,7 +2,15 @@
 
 use crate::canvas::Canvas;
 use crate::cpu::Cpu;
+use crate::disasm::disassemble;
 use crate::font::Font;
+
+/// How many instructions the debugger remembers, and how many of them
+/// and of the ones ahead the listing shows: thirteen lines, which is what
+/// fits under the registers in a sidebar as tall as the picture.
+const HISTORY: usize = 16;
+const HISTORY_SHOWN: usize = 4;
+const AHEAD_SHOWN: usize = 8;
 
 /// How far to move the machine before it stops again.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -30,6 +38,10 @@ pub enum Mode {
 pub struct Debugger {
     pub mode: Mode,
     pub open: bool,
+    /// Where the last few instructions ran from, oldest first. Bytes
+    /// behind the program counter cannot be read as a program — only
+    /// remembered as one.
+    pub history: Vec<u16>,
 }
 
 /// Text in the panels: light on dark.
@@ -48,13 +60,18 @@ impl Debugger {
         Debugger {
             mode: Mode::Running,
             open: false,
+            history: Vec::new(),
         }
     }
 
     /// Open the panels and stop the machine — or close them and let it go.
     pub fn toggle(&mut self) {
         self.open = !self.open;
-        self.mode = if self.open { Mode::Paused } else { Mode::Running };
+        self.mode = if self.open {
+            Mode::Paused
+        } else {
+            Mode::Running
+        };
     }
 
     /// Ask for one step. A running machine ignores the request: the step
@@ -65,21 +82,57 @@ impl Debugger {
         }
     }
 
-    /// Move the machine as far as the mode says. A step ends in a pause;
-    /// a jammed machine stops wherever it is.
+    /// Move the machine as far as the mode says, remembering every
+    /// instruction it passes. A step ends in a pause; a jammed machine
+    /// stops wherever it is.
     pub fn run(&mut self, cpu: &mut Cpu) {
         match self.mode {
-            Mode::Running => run_frame(cpu),
+            Mode::Running => self.run_frame(cpu),
             Mode::Paused => {}
             Mode::Step(Step::Instruction) => {
+                self.remember(cpu);
                 cpu.step();
             }
-            Mode::Step(Step::Scanline) => run_scanline(cpu),
-            Mode::Step(Step::Frame) => run_frame(cpu),
+            Mode::Step(Step::Scanline) => self.run_scanline(cpu),
+            Mode::Step(Step::Frame) => self.run_frame(cpu),
         }
 
         if let Mode::Step(_) = self.mode {
             self.mode = Mode::Paused;
+        }
+    }
+
+    /// Note where the CPU is about to run from, keeping the last few.
+    fn remember(&mut self, cpu: &Cpu) {
+        if self.history.len() == HISTORY {
+            self.history.remove(0);
+        }
+        self.history.push(cpu.pc);
+    }
+
+    /// Run until the clock's frame counter moves. A jammed machine keeps
+    /// its last picture.
+    fn run_frame(&mut self, cpu: &mut Cpu) {
+        let frame = cpu.bus.clock.frame;
+        while cpu.bus.clock.frame == frame {
+            self.remember(cpu);
+            if !cpu.step() {
+                break;
+            }
+        }
+    }
+
+    /// Run until the beam is on a different scanline. The stop lands on
+    /// an instruction boundary, never on the line's first dot: this CPU
+    /// finishes what it started, and the panel shows exactly how far
+    /// past the line it got.
+    fn run_scanline(&mut self, cpu: &mut Cpu) {
+        let scanline = cpu.bus.clock.scanline;
+        while cpu.bus.clock.scanline == scanline {
+            self.remember(cpu);
+            if !cpu.step() {
+                break;
+            }
         }
     }
 
@@ -92,45 +145,64 @@ impl Debugger {
             canvas.text(font, x, y + row * 10, text, color);
         };
 
-        line(0, &format!("A:{:02X} X:{:02X} Y:{:02X} SP:{:02X}", cpu.a, cpu.x, cpu.y, cpu.sp), INK);
+        line(
+            0,
+            &format!(
+                "A:{:02X} X:{:02X} Y:{:02X} SP:{:02X}",
+                cpu.a, cpu.x, cpu.y, cpu.sp
+            ),
+            INK,
+        );
         line(1, &format!("PC:{:04X}", cpu.pc), INK);
         line(2, "NV-BDIZC", DIM);
         line(3, &format!("{:08b}", cpu.status), INK);
 
         let clock = &cpu.bus.clock;
         line(5, &format!("frame {}", clock.frame), INK);
-        line(6, &format!("line {}  dot {}", clock.scanline, clock.dot), INK);
+        line(
+            6,
+            &format!("line {}  dot {}", clock.scanline, clock.dot),
+            INK,
+        );
+    }
+
+    /// The listing panel at (x, y): the last few instructions run, dim;
+    /// the one about to run, marked; and the ones after it, decoded from
+    /// the bytes ahead — which are only a program until a branch says
+    /// otherwise.
+    pub fn paint_listing(&self, canvas: &mut Canvas, font: &Font, cpu: &Cpu, x: usize, y: usize) {
+        let mut row = 0;
+        let mut line = |canvas: &mut Canvas, address: u16, marker: &str, color: u32| {
+            let (text, length) = disassemble(cpu, address);
+            let mut bytes = String::new();
+            for offset in 0..length {
+                match cpu.peek(address.wrapping_add(offset)) {
+                    Some(byte) => bytes.push_str(&format!("{byte:02X} ")),
+                    None => bytes.push_str("?? "),
+                }
+            }
+            let entry = format!("{marker}{address:04X}  {bytes:<9} {text}");
+            canvas.text(font, x, y + row * 10, &entry, color);
+            row += 1;
+            length
+        };
+
+        let behind = self.history.len().saturating_sub(HISTORY_SHOWN);
+        for &address in &self.history[behind..] {
+            line(canvas, address, " ", DIM);
+        }
+
+        let mut next = cpu.pc;
+        next = next.wrapping_add(line(canvas, next, ">", INK));
+        for _ in 0..AHEAD_SHOWN {
+            next = next.wrapping_add(line(canvas, next, " ", INK));
+        }
     }
 
     /// The keys, two dim lines wherever there is room for them.
     pub fn paint_keys(&self, canvas: &mut Canvas, font: &Font, x: usize, y: usize) {
         canvas.text(font, x, y, "Tab run/stop  N step", DIM);
         canvas.text(font, x, y + 10, "L scanline    F frame", DIM);
-    }
-
-}
-
-/// Run until the clock's frame counter moves — the loop `main` used to
-/// own. A jammed machine keeps its last picture.
-fn run_frame(cpu: &mut Cpu) {
-    let frame = cpu.bus.clock.frame;
-    while cpu.bus.clock.frame == frame {
-        if !cpu.step() {
-            break;
-        }
-    }
-}
-
-/// Run until the beam is on a different scanline. The stop lands on an
-/// instruction boundary, never on the line's first dot: this CPU finishes
-/// what it started, and the panel shows exactly how far past the line it
-/// got.
-fn run_scanline(cpu: &mut Cpu) {
-    let scanline = cpu.bus.clock.scanline;
-    while cpu.bus.clock.scanline == scanline {
-        if !cpu.step() {
-            break;
-        }
     }
 }
 
@@ -201,7 +273,10 @@ mod tests {
         let line = cpu.bus.clock.scanline;
         debugger.run(&mut cpu);
         assert_eq!(cpu.bus.clock.scanline, line + 1);
-        assert!(cpu.bus.clock.dot < 9, "at most one instruction past the line's start");
+        assert!(
+            cpu.bus.clock.dot < 9,
+            "at most one instruction past the line's start"
+        );
     }
 
     #[test]
@@ -214,5 +289,27 @@ mod tests {
         debugger.run(&mut cpu);
         assert_eq!(cpu.bus.clock.frame, 1);
         assert_eq!(debugger.mode, Mode::Paused);
+    }
+    #[test]
+    fn a_step_is_remembered() {
+        let mut debugger = Debugger::new();
+        debugger.toggle();
+        debugger.step(Step::Instruction);
+
+        let mut cpu = idling_machine();
+        debugger.run(&mut cpu);
+        assert_eq!(debugger.history, [0x8000]);
+    }
+
+    #[test]
+    fn the_memory_is_sixteen_deep() {
+        let mut debugger = Debugger::new();
+        let mut cpu = idling_machine();
+        debugger.run(&mut cpu);
+        assert_eq!(debugger.history.len(), HISTORY);
+        assert!(
+            debugger.history.iter().all(|&pc| pc == 0x8000),
+            "a jump to itself, forever"
+        );
     }
 }
