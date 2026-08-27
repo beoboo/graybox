@@ -34,6 +34,7 @@ use cartridge::Cartridge;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpu::Cpu;
 use debugger::{Debugger, Step};
+use debugger::{Mode, Page, Trap};
 use font::Font;
 
 /// The NES picture is exactly 256 pixels wide...
@@ -98,14 +99,10 @@ fn main() {
         if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
             debugger.toggle();
         }
-        if window.is_key_pressed(Key::N, KeyRepeat::Yes) {
-            debugger.step(Step::Instruction);
-        }
-        if window.is_key_pressed(Key::L, KeyRepeat::Yes) {
-            debugger.step(Step::Scanline);
-        }
-        if window.is_key_pressed(Key::F, KeyRepeat::Yes) {
-            debugger.step(Step::Frame);
+        // Every other key is the debugger's: a step, a trap, or a digit
+        // of one.
+        for key in window.get_keys_pressed(KeyRepeat::Yes) {
+            debugger.press(key);
         }
 
         if let Some(cpu) = &mut machine {
@@ -381,7 +378,12 @@ fn compose(frame: &[u32], cpu: Option<&Cpu>, debugger: &Debugger, font: &Font) -
             canvas.fill(WIDTH, 0, SIDEBAR, HEIGHT, debugger::PANEL);
             canvas.blit(0, 0, WIDTH, frame);
             debugger.paint_registers(&mut canvas, font, cpu, WIDTH + 8, 4);
-            debugger.paint_listing(&mut canvas, font, cpu, WIDTH + 8, 78);
+            match debugger.page {
+                Page::Listing => debugger.paint_listing(&mut canvas, font, cpu, WIDTH + 8, 78),
+                Page::Ledger => debugger.paint_ledger(&mut canvas, font, WIDTH + 8, 78),
+            }
+            debugger.paint_status(&mut canvas, font, WIDTH + 8, HEIGHT - 32);
+
             debugger.paint_keys(&mut canvas, font, WIDTH + 8, HEIGHT - 24);
 
             canvas
@@ -400,9 +402,32 @@ fn compose(frame: &[u32], cpu: Option<&Cpu>, debugger: &Debugger, font: &Font) -
 fn headless(cpu: &mut Cpu, options: &Options, out: &str) {
     let font = load_font();
     let mut debugger = Debugger::new();
-    for _ in 0..options.frames {
-        debugger.run(cpu);
+    // A trap set before the frames run springs as often as it likes
+    // during them; the ledger keeps every time. The picture is taken
+    // at the next stop after the frames — the panels open by then.
+    if let Some(trap) = options.trap {
+        debugger.arm(trap);
     }
+
+    // The frames, counted on the clock: a sprung trap ends a trip round
+    // this loop early, and the machine is let go again until the frames
+    // are all run. Then it runs to the next stop — or gives up after a
+    // second of nothing springing.
+    while cpu.bus.clock.frame < options.frames {
+        debugger.run(cpu);
+        if debugger.mode == Mode::Paused {
+            debugger.resume();
+        }
+    }
+    if options.trap.is_some() {
+        while debugger.mode == Mode::Running && cpu.bus.clock.frame < options.frames + 60 {
+            debugger.run(cpu);
+        }
+    }
+    if options.ledger {
+        debugger.page = Page::Ledger;
+    }
+
     if options.debug {
         debugger.toggle();
     }
@@ -447,6 +472,11 @@ struct Options {
     /// Stop the beam on this scanline of the frame after the last — the
     /// picture half painted, the way the debugger shows it.
     line: Option<u16>,
+    /// A trap to arm before the frames run: `--break ADDR` or
+    /// `--watch ADDR`, in hex.
+    trap: Option<Trap>,
+    /// Take the picture with the ledger page up instead of the listing.
+    ledger: bool,
 }
 
 /// Split the command line into file paths and switches — `--frames N`,
@@ -458,6 +488,8 @@ fn parse_args(args: &[String]) -> (Vec<String>, Options) {
         out: None,
         debug: false,
         line: None,
+        trap: None,
+        ledger: false,
     };
 
     let mut i = 0;
@@ -476,6 +508,17 @@ fn parse_args(args: &[String]) -> (Vec<String>, Options) {
                 options.line = args.get(i + 1).and_then(|n| n.parse().ok());
                 i += 1;
             }
+            "--break" | "--watch" => {
+                let address = args
+                    .get(i + 1)
+                    .and_then(|n| u16::from_str_radix(n, 16).ok());
+                options.trap = address.map(|address| match args[i].as_str() {
+                    "--break" => Trap::Execute(address),
+                    _ => Trap::Write(address),
+                });
+                i += 1;
+            }
+            "--ledger" => options.ledger = true,
             path => paths.push(path.to_string()),
         }
         i += 1;

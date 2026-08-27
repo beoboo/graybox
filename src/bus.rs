@@ -37,6 +37,12 @@ pub struct Bus {
     pub ppu_latch: Cell<u8>,
     pub ppu_latch_frame: [Cell<u64>; 8],
 
+    /// The one address the debugger has asked about, and what happened
+    /// to it during the current instruction. The bus cannot stop the
+    /// CPU between two of its accesses; it can only take a note.
+    pub watch: Option<u16>,
+    pub touched: Cell<Option<Touch>>,
+
     /// The console's own RAM: two kibibytes. All of it. It was 1983.
     pub ram: [u8; 2048],
 
@@ -62,6 +68,18 @@ pub struct Bus {
     pub irq_line: bool,
 }
 
+/// A note on the watched address: read, written, or both within one
+/// instruction, the last value that crossed, and where the beam was for
+/// it.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Touch {
+    pub read: bool,
+    pub written: bool,
+    pub value: u8,
+    pub scanline: u16,
+    pub dot: u16,
+}
+
 impl Bus {
     /// Wire a bus around a cartridge.
     pub fn new(cartridge: Cartridge) -> Bus {
@@ -74,6 +92,8 @@ impl Bus {
             open_bus: Cell::new(0),
             ppu_latch: Cell::new(0),
             ppu_latch_frame: [const { Cell::new(0) }; 8],
+            watch: None,
+            touched: Cell::new(None),
             ram: [0; 2048],
             // Built before `cartridge` moves in, since it reads from it.
             ppu: Ppu::new(cartridge.vertical_mirroring),
@@ -90,7 +110,22 @@ impl Bus {
     pub fn read(&self, address: u16) -> u8 {
         let value = self.read_decoded(address);
         self.open_bus.set(value);
+        self.note(address, value, false);
         value
+    }
+
+    /// Take a note if this access is to the watched address.
+    fn note(&self, address: u16, value: u8, write: bool) {
+        if self.watch != Some(address) {
+            return;
+        }
+        let mut touch = self.touched.get().unwrap_or_default();
+        touch.read |= !write;
+        touch.written |= write;
+        touch.value = value;
+        touch.scanline = self.clock.scanline;
+        touch.dot = self.clock.dot;
+        self.touched.set(Some(touch));
     }
 
     /// The PPU's latch, each bit decayed if stale: ~600 ms is 36
@@ -210,6 +245,8 @@ impl Bus {
         if matches!(address, 0x2000..=0x3FFF) {
             self.ppu_refresh(value, 0xFF);
         }
+        self.note(address, value, true);
+
         match address {
             0x0000..=0x1FFF => self.ram[address as usize % 2048] = value,
 
